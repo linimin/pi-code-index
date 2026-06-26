@@ -3,7 +3,7 @@
   "mission_anchor": "Fully implement `pi-code-index` across all explicitly documented project phases available in the repository, starting from the normative Phase 1 MVP and continuing through any additional concrete phase specs, while preserving the documented architecture of a thin pi extension backed by a local daemon.",
   "task_type": "completion-workflow",
   "evaluation_profile": "completion-rubric-v1",
-  "last_reground_at": "2026-06-26T03:12:30Z",
+  "last_reground_at": "2026-06-26T03:20:00Z",
   "plan_basis": "Repo truth plus `AGENTS.md` and `docs/mvp-spec.md`: Phase 1 MVP is the only normative implementation phase currently present. `docs/rfc.md` rollout phases remain rationale-only until promoted by a later explicit phase doc.",
   "candidate_slices": [
     {
@@ -74,7 +74,7 @@
         "`/index disable` stops repo background activity without purging cache by default, `/index reindex` performs a soft rebuild, and deterministic tests exercise `initializing`, `indexing`, `ready`, `stale`, `error`, and `disabled` transitions."
       ],
       "priority": 2,
-      "status": "committed",
+      "status": "done",
       "why_now": "A real control plane and repo registration path are prerequisite for truthful indexing, storage, and lifecycle semantics.",
       "blocked_on": [],
       "evidence": [
@@ -82,7 +82,8 @@
         "`src/daemon/sqlite-store.ts` now persists transactional baseline and overlay file facts, omitted-file records, structural symbol/import/export/reference rows, and coverage metadata in durable SQLite tables rooted under the existing repo anchors.",
         "`src/daemon/tsjs-analyzer.ts` now provides dependency-free TS/JS structural extraction with `analysisQuality: structural`, while non-primary files are persisted through fallback basic summaries only.",
         "`tests/index-storage.test.ts` deterministically covers discovery/filtering, immutable baseline plus mutable overlay population, structural vs basic analysis quality, and `/index disable` / `/index reindex` / `stale` / `error` transitions; `tests/control-plane.test.ts` was updated for truthful asynchronous readiness semantics.",
-        "Commit a18d882752cc0f0066181ae2fd4b84e8ca79da0f passed deterministic verification via `npm run check` and `npm test`; current HEAD preserves the same product diff plus canonical workflow bookkeeping."
+        "Commit a18d882752cc0f0066181ae2fd4b84e8ca79da0f passed deterministic verification via `npm run check` and `npm test`; current HEAD preserves the same product diff plus canonical workflow bookkeeping.",
+        "`completion-reviewer` recorded pass / acceptance with no findings for the same slice at current HEAD d47dac0aea61391d9d75650839bf632d55599a49, so `P1-INDEX-STORAGE-PIPELINE` is canonically accepted."
       ],
       "locked_notes": [
         "One immutable baseline DB per commit plus one mutable overlay DB per worktree is mandatory in Phase 1.",
@@ -122,15 +123,14 @@
         "README and deterministic tests describe and verify the shipped command and tool behavior, local-only daemon architecture, and operator recovery path through `/index doctor`, `/index reindex`, and `/index disable`."
       ],
       "priority": 3,
-      "status": "planned",
+      "status": "committed",
       "why_now": "The tool surface and shipped docs depend on the earlier slices producing real indexed data, operational repo states, and a truthful daemon boundary.",
-      "blocked_on": [
-        "p1-index-storage-and-analysis"
-      ],
+      "blocked_on": [],
       "evidence": [
-        "`src/extension/index.ts` still registers only the `/index` command and exposes no agent tools.",
-        "`src/shared/protocol.ts` does not yet define query contracts for `symbolLookup`, `fileSummary`, or `impactAnalysis`.",
-        "`README.md` still presents the repository as a scaffold rather than documenting shipped MVP operation."
+        "`src/shared/protocol.ts`, `src/extension/daemon-client.ts`, and `src/daemon/server.ts` now expose only the approved Phase 1 query methods `symbolLookup`, `fileSummary`, and `impactAnalysis` with deterministic caps, truncation metadata, freshness, coverage, provenance, and analysis-quality signaling.",
+        "`src/extension/index.ts` now registers only `symbol_lookup`, `file_summary`, and `impact_analysis`, and gates their activation to enabled healthy Git repos via daemon-backed status checks before agent start.",
+        "`tests/tools-parity.test.ts` and `tests/check.ts` deterministically verify tool registration, activation gating, structural and fallback query surfacing, documented caps, and operator-facing formatting; `README.md` now documents the shipped local-only daemon architecture and `/index doctor` / `/index reindex` / `/index disable` recovery path.",
+        "Commit b7fe5c9eaa8d8194011555960e7a86b1743526f5 passed deterministic verification via `npm run check` and `npm test`."
       ],
       "locked_notes": [
         "Expose only `symbol_lookup`, `file_summary`, and `impact_analysis` for Phase 1.",

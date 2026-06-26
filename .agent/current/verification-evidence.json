@@ -2,19 +2,19 @@
   "schema_version": 1,
   "artifact_type": "completion-verification-evidence",
   "subject_type": "selected_slice",
-  "slice_id": "p1-index-storage-and-analysis",
-  "goal": "Implement the Phase 1 indexing core: git-aware discovery and safety filtering, transactional SQLite baseline plus overlay lifecycle, TS/JS structural fact extraction, coarse non-primary fallback summaries, and truthful `/index disable` plus `/index reindex` state transitions.",
+  "slice_id": "p1-tools-and-ops-parity",
+  "goal": "Expose and wire the approved Phase 1 query tools with deterministic results, freshness and coverage metadata, and shipped docs plus test parity for the local-only extension and daemon architecture.",
   "contract_ids": [
-    "P1-INDEX-STORAGE-PIPELINE"
+    "P1-TOOLS-DIAGNOSTICS"
   ],
-  "basis_commit": "329dab218489e7abf9ad579f006eb671d032a6b3",
-  "head_sha": "a18d882752cc0f0066181ae2fd4b84e8ca79da0f",
+  "basis_commit": "d47dac0aea61391d9d75650839bf632d55599a49",
+  "head_sha": "b7fe5c9eaa8d8194011555960e7a86b1743526f5",
   "verification_commands": [
     "npm run check",
     "npm test"
   ],
   "outcome": "pass",
-  "recorded_at": "2026-06-26T03:16:19.713Z",
+  "recorded_at": "2026-06-26T04:10:00Z",
   "command_results": [
     {
       "command": "npm run check",
@@ -25,5 +25,5 @@
       "status": "pass"
     }
   ],
-  "summary": "Committed slice a18d882752cc0f0066181ae2fd4b84e8ca79da0f adds Phase 1 git-aware discovery and safety filtering, transactional baseline/overlay SQLite fact persistence, dependency-free TS/JS structural analysis plus basic fallback summaries, and deterministic lifecycle coverage for ready/stale/error/disabled transitions."
+  "summary": "Committed slice b7fe5c9eaa8d8194011555960e7a86b1743526f5 adds the approved Phase 1 tool surface, daemon query contracts with deterministic metadata and caps, healthy-repo tool activation gating, README operator guidance, and deterministic structural/basic tool coverage."
 }

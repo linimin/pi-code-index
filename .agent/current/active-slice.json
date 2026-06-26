@@ -4,42 +4,47 @@
   "task_type": "completion-workflow",
   "evaluation_profile": "completion-rubric-v1",
   "status": "committed",
-  "slice_id": "p1-index-storage-and-analysis",
-  "goal": "Implement the Phase 1 indexing core: git-aware discovery and safety filtering, transactional SQLite baseline plus overlay lifecycle, TS/JS structural fact extraction, coarse non-primary fallback summaries, and truthful `/index disable` plus `/index reindex` state transitions.",
+  "slice_id": "p1-tools-and-ops-parity",
+  "goal": "Expose and wire the approved Phase 1 query tools with deterministic results, freshness and coverage metadata, and shipped docs plus test parity for the local-only extension and daemon architecture.",
   "contract_ids": [
-    "P1-INDEX-STORAGE-PIPELINE"
+    "P1-TOOLS-DIAGNOSTICS"
   ],
   "acceptance_criteria": [
-    "Git-aware file discovery is bounded to the canonical repo root and finds eligible files via tracked files, modified tracked files, and untracked non-ignored files only, while enforcing the Phase 1 hard safety boundaries, default excludes, sensitive-file denylist, binary detection, and 2 MiB size cap.",
-    "The daemon maintains one immutable baseline DB per commit and one mutable overlay DB per worktree, commits query-visible writes transactionally, and answers status or doctor with truthful coverage, pending-file, and storage metadata.",
-    "TS/JS files receive structural symbol, import, export, reference, and file-summary extraction with `analysisQuality: structural`, while non-primary languages receive coarse file-summary fallback with `analysisQuality: basic` only.",
-    "`/index disable` stops repo background activity without purging cache by default, `/index reindex` performs a soft rebuild, and deterministic tests exercise `initializing`, `indexing`, `ready`, `stale`, `error`, and `disabled` transitions."
+    "The extension registers only the approved Phase 1 tools `symbol_lookup`, `file_summary`, and `impact_analysis`, and activates them only when cwd is inside an enabled, healthy git repo.",
+    "Daemon query methods `symbolLookup`, `fileSummary`, and `impactAnalysis` return the required Phase 1 fields, deterministic ordering, documented caps and truncation metadata, plus `freshness`, `coverage`, `provenance`, and `analysisQuality` metadata.",
+    "TS/JS structural results and fallback basic results are both surfaced through the tool APIs without exposing RFC-only tools or advanced retrieval features such as `smart_read`, `codebase_search`, embeddings, or shared-baseline behavior.",
+    "README and deterministic tests describe and verify the shipped command and tool behavior, local-only daemon architecture, and operator recovery path through `/index doctor`, `/index reindex`, and `/index disable`."
   ],
-  "priority": 2,
-  "why_now": "A real control plane and repo registration path are prerequisite for truthful indexing, storage, and lifecycle semantics.",
+  "priority": 3,
+  "why_now": "The tool surface and shipped docs depend on the earlier slices producing real indexed data, operational repo states, and a truthful daemon boundary.",
   "blocked_on": [],
   "locked_notes": [
-    "One immutable baseline DB per commit plus one mutable overlay DB per worktree is mandatory in Phase 1.",
-    "TS/JS are the only primary structural analyzers; non-primary languages must stay coarse/fallback-only in MVP."
+    "Expose only `symbol_lookup`, `file_summary`, and `impact_analysis` for Phase 1.",
+    "Do not add `smart_read`, `codebase_search`, embeddings, shared-baseline reuse, or other RFC-only post-MVP features."
   ],
   "must_fix_findings": [],
   "implementation_surfaces": [
+    "README.md",
     "package.json",
-    "src/daemon/repo-runtime.ts",
     "src/daemon/server.ts",
-    "src/daemon/sqlite-store.ts",
-    "src/daemon/tsjs-analyzer.ts",
+    "src/extension/daemon-client.ts",
+    "src/extension/index.ts",
     "src/shared/protocol.ts"
   ],
   "verification_commands": [
     "npm run check",
     "npm test"
   ],
-  "basis_commit": "329dab218489e7abf9ad579f006eb671d032a6b3",
+  "basis_commit": "587a960124e772877a7c389634f4377e726b47f5",
   "remaining_contract_ids_before": [
-    "P1-INDEX-STORAGE-PIPELINE",
     "P1-TOOLS-DIAGNOSTICS"
   ],
-  "release_blocker_count_before": 2,
-  "high_value_gap_count_before": 0
+  "release_blocker_count_before": 1,
+  "high_value_gap_count_before": 0,
+  "evidence": [
+    "`src/shared/protocol.ts`, `src/extension/daemon-client.ts`, and `src/daemon/server.ts` now expose only the approved Phase 1 query methods `symbolLookup`, `fileSummary`, and `impactAnalysis` with deterministic caps, truncation metadata, freshness, coverage, provenance, and analysis-quality signaling.",
+    "`src/extension/index.ts` now registers only `symbol_lookup`, `file_summary`, and `impact_analysis`, and gates their activation to enabled healthy Git repos via daemon-backed status checks before agent start.",
+    "`tests/tools-parity.test.ts` and `tests/check.ts` deterministically verify tool registration, activation gating, structural and fallback query surfacing, documented caps, and operator-facing formatting; `README.md` now documents the shipped local-only daemon architecture and `/index doctor` / `/index reindex` / `/index disable` recovery path.",
+    "Commit b7fe5c9eaa8d8194011555960e7a86b1743526f5 passed deterministic verification via `npm run check` and `npm test`."
+  ]
 }

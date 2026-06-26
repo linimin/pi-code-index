@@ -1,0 +1,50 @@
+{
+  "name": "@linimin/pi-code-index",
+  "version": "0.1.0",
+  "description": "Local-first code indexing for pi with a thin extension and background daemon.",
+  "type": "module",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "extension",
+    "indexing",
+    "code-intelligence"
+  ],
+  "files": [
+    "extensions",
+    "src",
+    "docs",
+    "AGENTS.md",
+    "README.md",
+    "tsconfig.json"
+  ],
+  "scripts": {
+    "check": "npm run typecheck",
+    "typecheck": "tsc --noEmit",
+    "dev:daemon": "tsx src/daemon/main.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "@types/node": "^20.0.0",
+    "tsx": "^4.0.0",
+    "typebox": "*",
+    "typescript": "^5.5.0"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  }
+}

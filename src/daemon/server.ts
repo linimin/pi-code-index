@@ -7,7 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import { promisify } from "node:util";
 
 import { RepoRuntime } from "./repo-runtime.ts";
-import { RepoRegistry } from "./repo-registry.ts";
+import { RepoRegistry, type PersistedRepoRecord } from "./repo-registry.ts";
 import { SqliteStoreManager, type FileAnalysisRecord, type OmittedFileRecord } from "./sqlite-store.ts";
 import { TsJsAnalyzer } from "./tsjs-analyzer.ts";
 import {
@@ -341,22 +341,26 @@ class SocketDaemonServer implements DaemonServer {
   }
 
   async getStatus(locator: RepoLocator): Promise<RepoStatus> {
-    const runtime = await this.ensureRuntime(locator);
-    await this.refreshRuntimeProjection(runtime, locator);
-    return this.buildStatus(runtime, { runtimeLoaded: this.runtimes.has(runtime.key) });
+    const observation = await this.observeRuntime(locator);
+    await this.refreshRuntimeProjection(observation.runtime, locator, {
+      syncRegistry: observation.runtimeLoaded,
+    });
+    return this.buildStatus(observation.runtime, { runtimeLoaded: observation.runtimeLoaded });
   }
 
   async getRepoDiagnostics(locator: RepoLocator): Promise<RepoDiagnostics> {
-    const runtime = await this.ensureRuntime(locator);
-    await this.refreshRuntimeProjection(runtime, locator);
-    const storageSummary = await this.storeManager.getStorageSummary(runtime.repoId, runtime.overlay);
-    const job = this.jobs.get(runtime.key);
+    const observation = await this.observeRuntime(locator);
+    await this.refreshRuntimeProjection(observation.runtime, locator, {
+      syncRegistry: observation.runtimeLoaded,
+    });
+    const storageSummary = await this.storeManager.getStorageSummary(observation.runtime.repoId, observation.runtime.overlay);
+    const job = observation.runtimeLoaded ? this.jobs.get(observation.runtime.key) : undefined;
 
-    return runtime.toDiagnostics({
+    return observation.runtime.toDiagnostics({
       health: this.health(),
       transport: asUnixTransport(this.options.socketPath),
       daemonLifecycle: this.buildDaemonLifecycleSnapshot(),
-      runtimeLoaded: this.runtimes.has(runtime.key),
+      runtimeLoaded: observation.runtimeLoaded,
       storageSummary,
       queueDepth: job?.active || job?.queued ? 1 : 0,
       activeJobs: job?.active ? ["index-rebuild"] : [],
@@ -693,28 +697,34 @@ class SocketDaemonServer implements DaemonServer {
     }
   }
 
-  private async refreshRuntimeProjection(runtime: RepoRuntime, locator: RepoLocator): Promise<void> {
-    const currentRuntime = await this.ensureRuntime(locator);
+  private async refreshRuntimeProjection(
+    runtime: RepoRuntime,
+    locator: RepoLocator,
+    options: { syncRegistry?: boolean } = {},
+  ): Promise<void> {
+    const syncRegistry = options.syncRegistry ?? true;
     const [baselineSnapshot, overlaySnapshot] = await Promise.all([
-      this.storeManager.readSnapshot(currentRuntime.baseline),
-      this.storeManager.readSnapshot(currentRuntime.overlay),
+      this.storeManager.readSnapshot(runtime.baseline),
+      this.storeManager.readSnapshot(runtime.overlay),
     ]);
     const baselineIndexed = baselineSnapshot.indexedFiles;
     const overlayIndexed = overlaySnapshot.indexedFiles;
     const eligibleFiles = baselineIndexed + overlayIndexed + baselineSnapshot.omittedFiles + overlaySnapshot.omittedFiles;
 
-    if (!currentRuntime.enabled) {
-      currentRuntime.syncCoverage({
-        baseline: currentRuntime.baseline,
-        overlay: currentRuntime.overlay,
+    if (!runtime.enabled) {
+      runtime.syncCoverage({
+        baseline: runtime.baseline,
+        overlay: runtime.overlay,
         indexedFiles: baselineIndexed + overlayIndexed,
         eligibleFiles,
         omittedFiles: baselineSnapshot.omittedFiles + overlaySnapshot.omittedFiles,
         pendingFiles: 0,
         lastIndexedAt: overlaySnapshot.lastIndexedAt ?? baselineSnapshot.lastIndexedAt,
       });
-      currentRuntime.state = "disabled";
-      await this.syncRegistryFromRuntime(locator, currentRuntime);
+      runtime.state = "disabled";
+      if (syncRegistry) {
+        await this.syncRegistryFromRuntime(locator, runtime);
+      }
       return;
     }
 
@@ -722,25 +732,27 @@ class SocketDaemonServer implements DaemonServer {
     try {
       currentDirty = await this.computeDirtySnapshot(locator);
     } catch (error) {
-      currentRuntime.syncCoverage({
-        baseline: currentRuntime.baseline,
-        overlay: currentRuntime.overlay,
+      runtime.syncCoverage({
+        baseline: runtime.baseline,
+        overlay: runtime.overlay,
         indexedFiles: baselineIndexed + overlayIndexed,
         eligibleFiles,
         omittedFiles: baselineSnapshot.omittedFiles + overlaySnapshot.omittedFiles,
         pendingFiles: 0,
         lastIndexedAt: overlaySnapshot.lastIndexedAt ?? baselineSnapshot.lastIndexedAt,
       });
-      if (currentRuntime.enabled) {
-        currentRuntime.markError(error instanceof Error ? error.message : String(error));
+      if (runtime.enabled) {
+        runtime.markError(error instanceof Error ? error.message : String(error));
       }
-      await this.syncRegistryFromRuntime(locator, currentRuntime);
+      if (syncRegistry) {
+        await this.syncRegistryFromRuntime(locator, runtime);
+      }
       return;
     }
 
-    currentRuntime.syncCoverage({
-      baseline: currentRuntime.baseline,
-      overlay: currentRuntime.overlay,
+    runtime.syncCoverage({
+      baseline: runtime.baseline,
+      overlay: runtime.overlay,
       indexedFiles: baselineIndexed + overlayIndexed,
       eligibleFiles,
       omittedFiles: baselineSnapshot.omittedFiles + overlaySnapshot.omittedFiles,
@@ -748,49 +760,63 @@ class SocketDaemonServer implements DaemonServer {
       lastIndexedAt: overlaySnapshot.lastIndexedAt ?? baselineSnapshot.lastIndexedAt,
     });
 
-    const job = this.jobs.get(currentRuntime.key);
-    if (!currentRuntime.enabled) {
-      currentRuntime.state = "disabled";
-      await this.syncRegistryFromRuntime(locator, currentRuntime);
+    const job = this.jobs.get(runtime.key);
+    if (!runtime.enabled) {
+      runtime.state = "disabled";
+      if (syncRegistry) {
+        await this.syncRegistryFromRuntime(locator, runtime);
+      }
       return;
     }
 
     if (job?.active || job?.queued) {
-      currentRuntime.markIndexing(currentDirty.files.length);
-      await this.syncRegistryFromRuntime(locator, currentRuntime);
+      runtime.markIndexing(currentDirty.files.length);
+      if (syncRegistry) {
+        await this.syncRegistryFromRuntime(locator, runtime);
+      }
       return;
     }
 
-    if (currentRuntime.lastError) {
-      currentRuntime.state = "error";
-      await this.syncRegistryFromRuntime(locator, currentRuntime);
+    if (runtime.lastError) {
+      runtime.state = "error";
+      if (syncRegistry) {
+        await this.syncRegistryFromRuntime(locator, runtime);
+      }
       return;
     }
 
     const snapshotMatches = currentDirty.signature === (overlaySnapshot.dirtySignature ?? "");
-    if (currentRuntime.lastSuccessfulIndexAt && snapshotMatches) {
-      currentRuntime.state = "ready";
-      currentRuntime.filesPending = 0;
-      await this.syncRegistryFromRuntime(locator, currentRuntime);
+    if (runtime.lastSuccessfulIndexAt && snapshotMatches) {
+      runtime.state = "ready";
+      runtime.filesPending = 0;
+      if (syncRegistry) {
+        await this.syncRegistryFromRuntime(locator, runtime);
+      }
       return;
     }
 
-    if (currentRuntime.lastSuccessfulIndexAt && currentDirty.files.length > 0 && currentDirty.oldestAgeMs >= STALE_SETTLE_MS) {
-      currentRuntime.markStale(currentDirty.files.length);
-      await this.syncRegistryFromRuntime(locator, currentRuntime);
+    if (runtime.lastSuccessfulIndexAt && currentDirty.files.length > 0 && currentDirty.oldestAgeMs >= STALE_SETTLE_MS) {
+      runtime.markStale(currentDirty.files.length);
+      if (syncRegistry) {
+        await this.syncRegistryFromRuntime(locator, runtime);
+      }
       return;
     }
 
-    if (!currentRuntime.lastSuccessfulIndexAt) {
-      currentRuntime.state = "initializing";
-      currentRuntime.filesPending = currentDirty.files.length;
-      await this.syncRegistryFromRuntime(locator, currentRuntime);
+    if (!runtime.lastSuccessfulIndexAt) {
+      runtime.state = "initializing";
+      runtime.filesPending = currentDirty.files.length;
+      if (syncRegistry) {
+        await this.syncRegistryFromRuntime(locator, runtime);
+      }
       return;
     }
 
-    currentRuntime.state = "ready";
-    currentRuntime.filesPending = currentDirty.files.length;
-    await this.syncRegistryFromRuntime(locator, currentRuntime);
+    runtime.state = "ready";
+    runtime.filesPending = currentDirty.files.length;
+    if (syncRegistry) {
+      await this.syncRegistryFromRuntime(locator, runtime);
+    }
   }
 
   private async analyzeFile(repoRelativePath: string, content: string): Promise<FileAnalysisRecord> {
@@ -1234,7 +1260,7 @@ class SocketDaemonServer implements DaemonServer {
     });
   }
 
-  private async ensureRuntime(locator: RepoLocator): Promise<RepoRuntime> {
+  private async observeRuntime(locator: RepoLocator): Promise<{ runtime: RepoRuntime; runtimeLoaded: boolean }> {
     const persisted = await this.registry.upsertFromLocator(locator);
     const runtimeKey = createRepoRuntimeKey(locator);
     const anchors = await this.storeManager.ensureRepoStores(locator);
@@ -1247,10 +1273,21 @@ class SocketDaemonServer implements DaemonServer {
         lastSuccessfulIndexAt: persisted.lastSuccessfulIndexAt,
         lastError: persisted.lastError,
       });
-      return existing;
+      return { runtime: existing, runtimeLoaded: true };
     }
 
-    const runtime = new RepoRuntime({
+    return {
+      runtime: this.createRuntime(locator, persisted, anchors),
+      runtimeLoaded: false,
+    };
+  }
+
+  private createRuntime(
+    locator: RepoLocator,
+    persisted: PersistedRepoRecord,
+    anchors: { baseline: StoreAnchor; overlay: StoreAnchor },
+  ): RepoRuntime {
+    return new RepoRuntime({
       repoId: persisted.repoId,
       repoName: locator.repoName,
       repoRoot: locator.repoRoot,
@@ -1266,9 +1303,14 @@ class SocketDaemonServer implements DaemonServer {
       lastSuccessfulIndexAt: persisted.lastSuccessfulIndexAt,
       lastError: persisted.lastError,
     });
+  }
 
-    this.runtimes.set(runtime.key, runtime);
-    return runtime;
+  private async ensureRuntime(locator: RepoLocator): Promise<RepoRuntime> {
+    const observation = await this.observeRuntime(locator);
+    if (!observation.runtimeLoaded) {
+      this.runtimes.set(observation.runtime.key, observation.runtime);
+    }
+    return observation.runtime;
   }
 
   private async listen(server: Server): Promise<void> {

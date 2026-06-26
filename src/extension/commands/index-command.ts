@@ -121,7 +121,6 @@ export function createIndexCommandHandler(overrides: Partial<IndexCommandDeps> =
         case "doctor": {
           const repo = await deps.resolveRepo(ctx.cwd);
           const client = deps.createClient();
-          await client.openRepo(repo);
           const diagnostics = await client.getRepoDiagnostics(repo);
           emit(ctx, formatDoctorMessage(diagnostics), "info");
           return;
@@ -130,7 +129,6 @@ export function createIndexCommandHandler(overrides: Partial<IndexCommandDeps> =
         default: {
           const repo = await deps.resolveRepo(ctx.cwd);
           const client = deps.createClient();
-          await client.openRepo(repo);
           const status = await client.getStatus(repo);
           emit(ctx, formatStatusMessage(status), "info");
           return;

@@ -80,6 +80,56 @@ test("daemon idles out after the last enabled repo is disabled and cleanly resta
   assert.equal(restartedStatus.state, "disabled");
 });
 
+test("/index status and /index doctor preserve unloaded runtime observability across disable and idle restart", async (t) => {
+  const tempRoot = await mkdtemp(join(tmpdir(), "pi-code-index-observe-"));
+  const repoDir = join(tempRoot, "repo");
+  const cacheDir = join(tempRoot, "cache");
+  const socketPath = join(cacheDir, "daemon.sock");
+  const clientOptions = { cacheDir, socketPath, startTimeoutMs: 4_000, requestTimeoutMs: 2_000 };
+  const client = new DaemonClient(clientOptions);
+  const indexCommand = createRegisteredIndexCommand(clientOptions);
+
+  t.after(async () => {
+    await stopDaemon(client);
+    await rm(tempRoot, { recursive: true, force: true });
+  });
+
+  await setupGitRepo(repoDir);
+  const repo = await resolveRepoLocator(repoDir);
+  await client.enableRepoIndexing(repo);
+  await waitFor(async () => (await client.getStatus(repo)).enabled, 3_000);
+
+  const disableStatus = await client.disableRepoIndexing(repo);
+  assert.equal(disableStatus.runtimeLoaded, false);
+  assert.equal(disableStatus.daemonLifecycle.loadedRuntimeCount, 0);
+
+  const statusAfterDisable = await runIndexCommand(indexCommand, "status", repoDir);
+  assert.match(statusAfterDisable[0]?.message ?? "", /Runtime loaded: no/);
+  assert.match(statusAfterDisable[0]?.message ?? "", /Daemon lifecycle: enabledRepos=0, loadedRuntimes=0, activeRequests=1, activeJobs=0/);
+
+  const doctorAfterDisable = await runIndexCommand(indexCommand, "doctor", repoDir);
+  assert.match(doctorAfterDisable[0]?.message ?? "", /Runtime loaded: no/);
+  assert.match(doctorAfterDisable[0]?.message ?? "", /Daemon lifecycle: enabledRepos=0, loadedRuntimes=0, activeRequests=1, activeJobs=0/);
+
+  const observedStatus = await client.getStatus(repo);
+  assert.equal(observedStatus.runtimeLoaded, false);
+  assert.equal(observedStatus.daemonLifecycle.loadedRuntimeCount, 0);
+
+  await waitFor(async () => !(await pathExists(socketPath)), 3_000);
+
+  const statusAfterRestart = await runIndexCommand(indexCommand, "status", repoDir);
+  assert.match(statusAfterRestart[0]?.message ?? "", /Runtime loaded: no/);
+  assert.match(statusAfterRestart[0]?.message ?? "", /Daemon lifecycle: enabledRepos=0, loadedRuntimes=0, activeRequests=1, activeJobs=0/);
+
+  const doctorAfterRestart = await runIndexCommand(indexCommand, "doctor", repoDir);
+  assert.match(doctorAfterRestart[0]?.message ?? "", /Runtime loaded: no/);
+  assert.match(doctorAfterRestart[0]?.message ?? "", /Daemon lifecycle: enabledRepos=0, loadedRuntimes=0, activeRequests=1, activeJobs=0/);
+
+  const restartedStatus = await client.getStatus(repo);
+  assert.equal(restartedStatus.runtimeLoaded, false);
+  assert.equal(restartedStatus.daemonLifecycle.loadedRuntimeCount, 0);
+});
+
 test("/index enable refuses to run outside a git repository", async (t) => {
   const tempRoot = await mkdtemp(join(tmpdir(), "pi-code-index-test-"));
   const cacheDir = join(tempRoot, "cache");

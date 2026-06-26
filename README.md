@@ -80,4 +80,5 @@ docs/                MVP spec and RFC context
 
 - `docs/mvp-spec.md` — normative Phase 1 spec
 - `docs/rfc.md` — design rationale and future phases
+- `docs/analyzer-plugin-system.md` — normative implementation plan for future analyzer plugin work when explicitly requested
 - `AGENTS.md` — repo guardrails for coding agents

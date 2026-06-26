@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { basename } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
@@ -38,6 +39,15 @@ export interface DaemonClientOptions {
 
 export interface DaemonCallOptions {
   startIfNeeded?: boolean;
+}
+
+export interface RegistryRepoHint {
+  repoId: string;
+  worktreeId: string;
+  enabled: boolean;
+  state: string;
+  lastSuccessfulIndexAt?: string;
+  lastDisabledAt?: string;
 }
 
 export type RepoContextErrorCode = "git_unavailable" | "not_git_repo" | "git_error";
@@ -99,6 +109,54 @@ export class DaemonRemoteError extends Error {
 
 export function defaultSocketPath(): string {
   return buildRuntimePaths().socketPath;
+}
+
+export function readRegistryRepoHint(
+  locator: Pick<RepoLocator, "worktreeId">,
+  options: Pick<DaemonClientOptions, "cacheDir" | "socketPath"> = {},
+): RegistryRepoHint | null {
+  const runtimePaths = buildRuntimePaths({
+    cacheDir: options.cacheDir,
+    socketPath: options.socketPath,
+  });
+
+  let db: DatabaseSync | undefined;
+  try {
+    db = new DatabaseSync(runtimePaths.registryDbPath, { open: true, readOnly: true });
+    const row = db.prepare(`
+      SELECT repo_id, worktree_id, enabled, state, last_successful_index_at, last_disabled_at
+      FROM repo_registry
+      WHERE worktree_id = ?
+    `).get(locator.worktreeId) as {
+      repo_id: string;
+      worktree_id: string;
+      enabled: number;
+      state: string;
+      last_successful_index_at: string | null;
+      last_disabled_at: string | null;
+    } | undefined;
+
+    if (!row) {
+      return null;
+    }
+
+    return {
+      repoId: row.repo_id,
+      worktreeId: row.worktree_id,
+      enabled: row.enabled === 1,
+      state: row.state,
+      lastSuccessfulIndexAt: row.last_successful_index_at ?? undefined,
+      lastDisabledAt: row.last_disabled_at ?? undefined,
+    };
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || /no such table/i.test(String(error))) {
+      return null;
+    }
+    throw error;
+  } finally {
+    db?.close();
+  }
 }
 
 export async function resolveRepoLocator(cwd: string): Promise<RepoLocator> {

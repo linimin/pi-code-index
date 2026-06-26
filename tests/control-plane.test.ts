@@ -45,6 +45,41 @@ test("daemon lazy-starts and handshakes over the Unix socket", async (t) => {
   assert.equal(await pathExists(socketPath), true);
 });
 
+
+test("daemon idles out after the last enabled repo is disabled and cleanly restarts on demand", async (t) => {
+  const tempRoot = await mkdtemp(join(tmpdir(), "pi-code-index-idle-"));
+  const repoDir = join(tempRoot, "repo");
+  const cacheDir = join(tempRoot, "cache");
+  const socketPath = join(cacheDir, "daemon.sock");
+  const client = new DaemonClient({ cacheDir, socketPath, startTimeoutMs: 4_000, requestTimeoutMs: 2_000 });
+
+  t.after(async () => {
+    await stopDaemon(client);
+    await rm(tempRoot, { recursive: true, force: true });
+  });
+
+  await setupGitRepo(repoDir);
+  const repo = await resolveRepoLocator(repoDir);
+  await client.enableRepoIndexing(repo);
+  await waitFor(async () => (await client.getStatus(repo)).enabled, 3_000);
+
+  const disableStatus = await client.disableRepoIndexing(repo);
+  assert.equal(disableStatus.enabled, false);
+  assert.equal(disableStatus.state, "disabled");
+
+  await waitFor(async () => !(await pathExists(socketPath)), 3_000);
+  assert.equal(await pathExists(socketPath), false);
+  assert.equal(await pathExists(join(cacheDir, "daemon.pid")), false);
+
+  const restartedHealth = await client.health();
+  assert.equal(restartedHealth.protocolVersion, DAEMON_PROTOCOL_VERSION);
+  assert.equal(await pathExists(socketPath), true);
+
+  const restartedStatus = await client.getStatus(repo);
+  assert.equal(restartedStatus.enabled, false);
+  assert.equal(restartedStatus.state, "disabled");
+});
+
 test("/index enable refuses to run outside a git repository", async (t) => {
   const tempRoot = await mkdtemp(join(tmpdir(), "pi-code-index-test-"));
   const cacheDir = join(tempRoot, "cache");

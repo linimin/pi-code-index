@@ -20,6 +20,9 @@ async function main(): Promise<void> {
     cacheDir: runtimePaths.cacheDir,
     socketPath: runtimePaths.socketPath,
     version: await readPackageVersion(),
+    onIdleShutdown: () => {
+      process.exit(0);
+    },
   });
 
   try {

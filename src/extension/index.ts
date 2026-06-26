@@ -7,6 +7,7 @@ import {
   ProtocolMismatchError,
   RepoContextError,
   UnsupportedPlatformError,
+  readRegistryRepoHint,
   resolveRepoLocator,
 } from "./daemon-client.ts";
 import type {
@@ -125,6 +126,11 @@ export default function createPiCodeIndexExtension(pi: ExtensionAPI): void {
 async function shouldEnableIndexTools(cwd: string): Promise<boolean> {
   try {
     const repo = await resolveRepoLocator(cwd);
+    const registryHint = readRegistryRepoHint(repo);
+    if (!registryHint?.enabled) {
+      return false;
+    }
+
     const client = new DaemonClient();
     const status = await client.getStatus(repo);
     return isHealthyRepoStatus(status);

@@ -48,12 +48,15 @@ const execFileAsync = promisify(execFile);
 const DEFAULT_EXCLUDED_DIRS = new Set([".git", "node_modules", "dist", "build", ".next", "coverage", "vendor", "target", ".venv"]);
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
 const STALE_SETTLE_MS = 2_000;
+const DEFAULT_IDLE_SHUTDOWN_GRACE_MS = 1_000;
 
 export interface DaemonServerOptions {
   cacheDir?: string;
   socketPath: string;
   version?: string;
   indexingDebounceMs?: number;
+  idleShutdownGraceMs?: number;
+  onIdleShutdown?: () => void | Promise<void>;
 }
 
 export interface DaemonServer {
@@ -108,6 +111,7 @@ interface IndexJobState {
   active: boolean;
   queued: boolean;
   timer?: NodeJS.Timeout;
+  abortController?: AbortController;
 }
 
 interface DirtySnapshot {
@@ -178,8 +182,12 @@ class SocketDaemonServer implements DaemonServer {
   private readonly jobs = new Map<string, IndexJobState>();
   private readonly options: DaemonServerOptions;
   private readonly indexingDebounceMs: number;
+  private readonly idleShutdownGraceMs: number;
   private server?: Server;
   private started = false;
+  private activeRequests = 0;
+  private idleShutdownTimer?: NodeJS.Timeout;
+  private idleShutdownInFlight = false;
 
   constructor(options: DaemonServerOptions) {
     this.options = options;
@@ -196,6 +204,7 @@ class SocketDaemonServer implements DaemonServer {
       cacheDir: this.runtimePaths.cacheDir,
     });
     this.indexingDebounceMs = options.indexingDebounceMs ?? 50;
+    this.idleShutdownGraceMs = options.idleShutdownGraceMs ?? DEFAULT_IDLE_SHUTDOWN_GRACE_MS;
   }
 
   async start(): Promise<void> {
@@ -239,13 +248,20 @@ class SocketDaemonServer implements DaemonServer {
 
     this.server = server;
     this.started = true;
+    this.updateIdleShutdownState();
   }
 
   async stop(): Promise<void> {
+    if (this.idleShutdownTimer) {
+      clearTimeout(this.idleShutdownTimer);
+      this.idleShutdownTimer = undefined;
+    }
+
     for (const job of this.jobs.values()) {
       if (job.timer) {
         clearTimeout(job.timer);
       }
+      job.abortController?.abort();
     }
     this.jobs.clear();
 
@@ -313,17 +329,13 @@ class SocketDaemonServer implements DaemonServer {
   async disableRepoIndexing(locator: RepoLocator): Promise<RepoStatus> {
     const runtime = await this.ensureRuntime(locator);
     runtime.disable();
-    const job = this.jobs.get(runtime.key);
-    if (job?.timer) {
-      clearTimeout(job.timer);
-      job.timer = undefined;
-      job.queued = false;
-      job.active = false;
-    }
+    const status = runtime.toStatus(this.health(), asUnixTransport(this.options.socketPath));
+    this.cancelJob(runtime.key);
     await this.registry.markDisabled(locator, runtime.repoId);
     await this.syncRegistryFromRuntime(locator, runtime);
-    await this.refreshRuntimeProjection(runtime, locator);
-    return runtime.toStatus(this.health(), asUnixTransport(this.options.socketPath));
+    this.runtimes.delete(runtime.key);
+    this.updateIdleShutdownState();
+    return status;
   }
 
   async getStatus(locator: RepoLocator): Promise<RepoStatus> {
@@ -565,6 +577,7 @@ class SocketDaemonServer implements DaemonServer {
     if (job.active) {
       job.queued = true;
       this.jobs.set(runtime.key, job);
+      this.updateIdleShutdownState();
       return;
     }
 
@@ -578,6 +591,7 @@ class SocketDaemonServer implements DaemonServer {
       void this.runIndexJob(runtime, locator, trigger);
     }, this.indexingDebounceMs);
     this.jobs.set(runtime.key, job);
+    this.updateIdleShutdownState();
   }
 
   private async runIndexJob(runtime: RepoRuntime, locator: RepoLocator, trigger: "enable" | "reindex"): Promise<void> {
@@ -586,25 +600,34 @@ class SocketDaemonServer implements DaemonServer {
       job.active = false;
       job.queued = false;
       this.jobs.set(runtime.key, job);
+      this.updateIdleShutdownState();
       return;
     }
 
+    const abortController = new AbortController();
+    job.abortController = abortController;
     job.active = true;
     job.queued = false;
     this.jobs.set(runtime.key, job);
+    this.updateIdleShutdownState();
 
     try {
       const refreshedRuntime = await this.ensureRuntime(locator);
+      throwIfAborted(abortController.signal);
       const dirtySnapshot = await this.computeDirtySnapshot(locator);
+      throwIfAborted(abortController.signal);
       refreshedRuntime.markIndexing(dirtySnapshot.files.length);
       await this.syncRegistryFromRuntime(locator, refreshedRuntime);
 
       const baselineDiscovery = await this.discoverBaselineFiles(locator);
+      throwIfAborted(abortController.signal);
       const overlayDiscovery = await this.discoverOverlayFiles(locator);
+      throwIfAborted(abortController.signal);
       const [baselineRecords, overlayRecords] = await Promise.all([
         Promise.all(baselineDiscovery.files.map((file) => this.analyzeFile(file.repoRelativePath, file.content))),
         Promise.all(overlayDiscovery.files.map((file) => this.analyzeFile(file.repoRelativePath, file.content))),
       ]);
+      throwIfAborted(abortController.signal);
 
       const indexedAt = new Date().toISOString();
       const baseline = await this.storeManager.replaceBaselineIndex({
@@ -618,6 +641,7 @@ class SocketDaemonServer implements DaemonServer {
         indexedAt,
         dirtySignature: "baseline",
       });
+      throwIfAborted(abortController.signal);
       const overlay = await this.storeManager.replaceOverlayIndex({
         anchor: refreshedRuntime.overlay,
         repoId: refreshedRuntime.repoId,
@@ -629,6 +653,7 @@ class SocketDaemonServer implements DaemonServer {
         indexedAt,
         dirtySignature: dirtySnapshot.signature,
       });
+      throwIfAborted(abortController.signal);
 
       refreshedRuntime.markReady({
         baseline,
@@ -647,16 +672,20 @@ class SocketDaemonServer implements DaemonServer {
 
       await this.refreshRuntimeProjection(refreshedRuntime, locator);
     } catch (error) {
-      runtime.markError(error instanceof Error ? error.message : String(error));
-      await this.syncRegistryFromRuntime(locator, runtime);
+      if (!isAbortError(error)) {
+        runtime.markError(error instanceof Error ? error.message : String(error));
+        await this.syncRegistryFromRuntime(locator, runtime);
+      }
     } finally {
       job.active = false;
+      job.abortController = undefined;
       const rerun = job.queued;
       job.queued = false;
       this.jobs.set(runtime.key, job);
       if (rerun && runtime.enabled) {
         this.scheduleIndex(runtime, locator, trigger);
       }
+      this.updateIdleShutdownState();
     }
   }
 
@@ -669,6 +698,21 @@ class SocketDaemonServer implements DaemonServer {
     const baselineIndexed = baselineSnapshot.indexedFiles;
     const overlayIndexed = overlaySnapshot.indexedFiles;
     const eligibleFiles = baselineIndexed + overlayIndexed + baselineSnapshot.omittedFiles + overlaySnapshot.omittedFiles;
+
+    if (!currentRuntime.enabled) {
+      currentRuntime.syncCoverage({
+        baseline: currentRuntime.baseline,
+        overlay: currentRuntime.overlay,
+        indexedFiles: baselineIndexed + overlayIndexed,
+        eligibleFiles,
+        omittedFiles: baselineSnapshot.omittedFiles + overlaySnapshot.omittedFiles,
+        pendingFiles: 0,
+        lastIndexedAt: overlaySnapshot.lastIndexedAt ?? baselineSnapshot.lastIndexedAt,
+      });
+      currentRuntime.state = "disabled";
+      await this.syncRegistryFromRuntime(locator, currentRuntime);
+      return;
+    }
 
     let currentDirty: DirtySnapshot;
     try {
@@ -916,33 +960,41 @@ class SocketDaemonServer implements DaemonServer {
   }
 
   private async dispatch(rawRequest: string): Promise<DaemonResponse> {
-    let request: DaemonRequest;
+    this.activeRequests += 1;
+    this.updateIdleShutdownState();
 
     try {
-      request = JSON.parse(rawRequest) as DaemonRequest;
-    } catch (error) {
-      return this.errorResponse("unknown", new RequestError("invalid_request", "Request body is not valid JSON.", error));
-    }
+      let request: DaemonRequest;
 
-    if (!request || typeof request.id !== "string" || typeof request.method !== "string") {
-      return this.errorResponse(
-        typeof request?.id === "string" ? request.id : "unknown",
-        new RequestError("invalid_request", "Request must include string `id` and `method` fields."),
-      );
-    }
-
-    try {
-      const result = await this.dispatchMethod(request.method as DaemonMethod, request.params);
-      return this.successResponse(request.id, result);
-    } catch (error) {
-      if (error instanceof RequestError) {
-        return this.errorResponse(request.id, error);
+      try {
+        request = JSON.parse(rawRequest) as DaemonRequest;
+      } catch (error) {
+        return this.errorResponse("unknown", new RequestError("invalid_request", "Request body is not valid JSON.", error));
       }
 
-      return this.errorResponse(
-        request.id,
-        new RequestError("internal_error", error instanceof Error ? error.message : String(error)),
-      );
+      if (!request || typeof request.id !== "string" || typeof request.method !== "string") {
+        return this.errorResponse(
+          typeof request?.id === "string" ? request.id : "unknown",
+          new RequestError("invalid_request", "Request must include string `id` and `method` fields."),
+        );
+      }
+
+      try {
+        const result = await this.dispatchMethod(request.method as DaemonMethod, request.params);
+        return this.successResponse(request.id, result);
+      } catch (error) {
+        if (error instanceof RequestError) {
+          return this.errorResponse(request.id, error);
+        }
+
+        return this.errorResponse(
+          request.id,
+          new RequestError("internal_error", error instanceof Error ? error.message : String(error)),
+        );
+      }
+    } finally {
+      this.activeRequests = Math.max(0, this.activeRequests - 1);
+      this.updateIdleShutdownState();
     }
   }
 
@@ -1195,6 +1247,71 @@ class SocketDaemonServer implements DaemonServer {
       rm(this.options.socketPath, { force: true }).catch(() => undefined),
       rm(this.runtimePaths.pidFile, { force: true }).catch(() => undefined),
     ]);
+  }
+
+  private cancelJob(runtimeKey: string): void {
+    const job = this.jobs.get(runtimeKey);
+    if (!job) {
+      return;
+    }
+
+    if (job.timer) {
+      clearTimeout(job.timer);
+      job.timer = undefined;
+    }
+    job.abortController?.abort();
+    job.abortController = undefined;
+    job.active = false;
+    job.queued = false;
+    this.jobs.set(runtimeKey, job);
+  }
+
+  private updateIdleShutdownState(): void {
+    if (!this.started) {
+      return;
+    }
+
+    const shouldIdleShutdown = this.registry.listEnabled().length === 0 && this.activeRequests === 0 && !this.hasActiveOrQueuedJobs();
+    if (!shouldIdleShutdown) {
+      if (this.idleShutdownTimer) {
+        clearTimeout(this.idleShutdownTimer);
+        this.idleShutdownTimer = undefined;
+      }
+      return;
+    }
+
+    if (this.idleShutdownTimer || this.idleShutdownInFlight) {
+      return;
+    }
+
+    this.idleShutdownTimer = setTimeout(() => {
+      this.idleShutdownTimer = undefined;
+      void this.performIdleShutdown();
+    }, this.idleShutdownGraceMs);
+  }
+
+  private hasActiveOrQueuedJobs(): boolean {
+    for (const job of this.jobs.values()) {
+      if (job.active || job.queued || job.timer) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private async performIdleShutdown(): Promise<void> {
+    const shouldIdleShutdown = this.started && this.registry.listEnabled().length === 0 && this.activeRequests === 0 && !this.hasActiveOrQueuedJobs();
+    if (!shouldIdleShutdown || this.idleShutdownInFlight) {
+      return;
+    }
+
+    this.idleShutdownInFlight = true;
+    try {
+      await this.stop();
+      await this.options.onIdleShutdown?.();
+    } finally {
+      this.idleShutdownInFlight = false;
+    }
   }
 }
 
@@ -1465,6 +1582,18 @@ function classifyImpactRisk(areaCount: number, quality: AnalysisQuality): "low" 
     return "medium";
   }
   return "low";
+}
+
+function throwIfAborted(signal: AbortSignal): void {
+  if (signal.aborted) {
+    const error = new Error("Index job aborted.");
+    error.name = "AbortError";
+    throw error;
+  }
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
 }
 
 async function canConnect(socketPath: string): Promise<boolean> {

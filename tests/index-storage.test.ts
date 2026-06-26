@@ -83,6 +83,12 @@ test("indexing pipeline persists structural and fallback analysis with truthful 
   assert.equal(status.state, "disabled");
   assert.equal(await pathExists(status.baseline.dbPath), true);
   assert.equal(await pathExists(status.overlay.dbPath), true);
+
+  await rm(repoDir, { recursive: true, force: true });
+  const disabledStatus = await server.getStatus(repo);
+  assert.equal(disabledStatus.enabled, false);
+  assert.equal(disabledStatus.state, "disabled");
+  assert.equal(disabledStatus.lastError, undefined);
 });
 
 test("registry persists enabled repo lifecycle across daemon restart", async (t) => {

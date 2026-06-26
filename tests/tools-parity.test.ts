@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -66,6 +66,11 @@ test("extension registers only the approved Phase 1 tools and activates them onl
   assert.deepEqual(activeTools, ["read"]);
 
   await seedToolRepo(repoDir);
+  assert.equal(await pathExists(socketPath), false);
+  await handlers.get("before_agent_start")?.({}, createEventContext(repoDir));
+  assert.deepEqual(activeTools, ["read"]);
+  assert.equal(await pathExists(socketPath), false);
+
   const repo = await resolveRepoLocator(repoDir);
   await client.openRepo(repo);
   await client.enableRepoIndexing(repo);
@@ -73,6 +78,14 @@ test("extension registers only the approved Phase 1 tools and activates them onl
 
   await handlers.get("before_agent_start")?.({}, createEventContext(repoDir));
   assert.deepEqual(activeTools, ["read", "symbol_lookup", "file_summary", "impact_analysis"]);
+
+  await client.disableRepoIndexing(repo);
+  await waitFor(() => pathExists(socketPath).then((exists) => !exists), 3_000);
+  activeTools = ["read"];
+
+  await handlers.get("before_agent_start")?.({}, createEventContext(repoDir));
+  assert.deepEqual(activeTools, ["read"]);
+  assert.equal(await pathExists(socketPath), false);
 });
 
 test("tool queries surface deterministic structural and fallback results with Phase 1 metadata and caps", async (t) => {
@@ -219,6 +232,27 @@ async function waitForState(
   }
 
   throw new Error(`Timed out waiting for states: ${states.join(", ")}`);
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitFor(check: () => Promise<boolean>, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await check()) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+
+  throw new Error(`Timed out after ${timeoutMs}ms`);
 }
 
 async function stopDaemon(client: DaemonClient): Promise<void> {

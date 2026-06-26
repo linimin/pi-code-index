@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "mission_anchor": "Fully implement the single-daemon lifecycle upgrade for pi-code-index so it uses a persistent repo registry, supports automatic idle shutdown, unloads disabled repo runtimes immediately, and exposes daemon-wide observability through doctor/status flows without introducing a new public command surface.",
+  "workflow_entry_status": "active",
+  "workflow_entry_source": "/cook",
+  "workflow_entry_confirmed_at": "2026-06-26T03:54:58.550Z",
+  "workflow_session_id": "wf-mquedvxc-fyl8q8",
+  "startup_brief_path": ".agent/current/startup-brief.json",
+  "current_phase": "post_commit_review",
+  "continuation_policy": "continue",
+  "continuation_reason": "Slice daemon-unload-idle-and-registry-hints was implemented at HEAD ac789cb956a15d04318f2e1f1b5397b68f9db2f9. Next step is reviewer validation of unload-on-disable, daemon idle shutdown, and registry-first no-wakeup gating.",
+  "project_done": false,
+  "task_type": "completion-workflow",
+  "evaluation_profile": "completion-rubric-v1",
+  "requires_reground": false,
+  "slices_since_last_reground": 1,
+  "remaining_release_blockers": 2,
+  "remaining_high_value_gaps": 0,
+  "unsatisfied_contract_ids": [
+    "LIFECYCLE-UNLOAD-IDLE-GATING",
+    "LIFECYCLE-OBSERVABILITY"
+  ],
+  "release_blocker_ids": [
+    "LIFECYCLE-UNLOAD-IDLE-GATING",
+    "LIFECYCLE-OBSERVABILITY"
+  ],
+  "next_mandatory_action": "Review selected slice daemon-unload-idle-and-registry-hints",
+  "next_mandatory_role": "completion-reviewer",
+  "remaining_stop_judges": 2,
+  "current_stop_wave_id": 0,
+  "last_reground_at": "2026-06-26T04:02:30Z",
+  "last_auditor_verdict": null,
+  "contract_status": "in_progress",
+  "latest_completed_slice": {
+    "slice_id": "daemon-unload-idle-and-registry-hints",
+    "commit_sha": "ac789cb956a15d04318f2e1f1b5397b68f9db2f9"
+  },
+  "latest_verified_slice": {
+    "slice_id": "daemon-registry-foundation",
+    "commit_sha": "a02764b17a4c719e538508bfb5429b02fc461d1f",
+    "accepted_via": "completion-reviewer"
+  }
+}

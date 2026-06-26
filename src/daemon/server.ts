@@ -2,7 +2,8 @@ import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createServer, createConnection, type Server, type Socket } from "node:net";
-import { dirname, join, relative } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { promisify } from "node:util";
 
 import { RepoRuntime } from "./repo-runtime.ts";
@@ -10,20 +11,37 @@ import { SqliteStoreManager, type FileAnalysisRecord, type OmittedFileRecord } f
 import { TsJsAnalyzer } from "./tsjs-analyzer.ts";
 import {
   DAEMON_PROTOCOL_VERSION,
+  FILE_SUMMARY_RELATED_FILE_LIMIT,
+  IMPACT_ANALYSIS_AREA_LIMIT,
+  IMPACT_ANALYSIS_SUGGESTED_READ_LIMIT,
+  SYMBOL_LOOKUP_MATCH_LIMIT,
   asUnixTransport,
   buildRuntimePaths,
   createRepoId,
   createRepoRuntimeKey,
+  type AnalysisQuality,
   type DaemonErrorResponse,
   type DaemonMethod,
   type DaemonRequest,
   type DaemonResponse,
   type DaemonSuccessResponse,
+  type FileSummaryParams,
+  type FileSummaryResponse,
   type HealthResponse,
+  type ImpactAnalysisParams,
+  type ImpactAnalysisResponse,
+  type ImpactArea,
   type OpenRepoResponse,
+  type QueryMetadata,
+  type QueryRange,
   type RepoDiagnostics,
+  type RepoFreshness,
   type RepoLocator,
   type RepoStatus,
+  type ResultProvenance,
+  type SymbolLookupMatch,
+  type SymbolLookupParams,
+  type SymbolLookupResponse,
 } from "../shared/protocol.ts";
 
 const execFileAsync = promisify(execFile);
@@ -48,6 +66,9 @@ export interface DaemonServer {
   getStatus(locator: RepoLocator): Promise<RepoStatus>;
   getRepoDiagnostics(locator: RepoLocator): Promise<RepoDiagnostics>;
   reindexRepo(locator: RepoLocator): Promise<RepoStatus>;
+  symbolLookup(params: SymbolLookupParams): Promise<SymbolLookupResponse>;
+  fileSummary(params: FileSummaryParams): Promise<FileSummaryResponse>;
+  impactAnalysis(params: ImpactAnalysisParams): Promise<ImpactAnalysisResponse>;
 }
 
 export class DaemonAlreadyRunningError extends Error {
@@ -108,6 +129,41 @@ interface OverlayCandidate {
 interface DiscoveryResult<TFile> {
   files: TFile[];
   omitted: OmittedFileRecord[];
+}
+
+interface IndexedFileView {
+  repoRelativePath: string;
+  language: string;
+  analysisQuality: AnalysisQuality;
+  lineCount: number;
+  summary: {
+    lineCount: number;
+    byteCount: number;
+    preview: string;
+  };
+  symbols: Array<{
+    name: string;
+    kind: string;
+    startLine: number;
+    endLine: number;
+    exported: boolean;
+  }>;
+  imports: Array<{
+    moduleSpecifier: string;
+    importedName: string;
+    localName: string;
+    isTypeOnly: boolean;
+  }>;
+  exports: Array<{
+    exportedName: string;
+    kind: string;
+    moduleSpecifier?: string;
+  }>;
+  references: Array<{
+    name: string;
+    line: number;
+    column: number;
+  }>;
 }
 
 class SocketDaemonServer implements DaemonServer {
@@ -227,6 +283,9 @@ class SocketDaemonServer implements DaemonServer {
         "getStatus",
         "getRepoDiagnostics",
         "reindexRepo",
+        "symbolLookup",
+        "fileSummary",
+        "impactAnalysis",
       ],
     };
   }
@@ -284,6 +343,212 @@ class SocketDaemonServer implements DaemonServer {
     runtime.reindex();
     this.scheduleIndex(runtime, locator, "reindex");
     return runtime.toStatus(this.health(), asUnixTransport(this.options.socketPath));
+  }
+
+  async symbolLookup(params: SymbolLookupParams): Promise<SymbolLookupResponse> {
+    const status = await this.assertHealthyRepo(params.repo);
+    const files = this.readMergedIndexedFiles(status);
+    const query = params.symbol.trim();
+    const requestedLimit = clampPositiveInt(params.limit, SYMBOL_LOOKUP_MATCH_LIMIT);
+    const candidates = files.flatMap((file) =>
+      file.symbols.map((symbol) => ({
+        matchClass: classifySymbolMatch(query, symbol.name),
+        file,
+        symbol,
+      })),
+    ).filter((candidate) => candidate.matchClass.score > 0);
+
+    candidates.sort((left, right) => {
+      if (right.matchClass.score !== left.matchClass.score) {
+        return right.matchClass.score - left.matchClass.score;
+      }
+      if (left.matchClass.rank !== right.matchClass.rank) {
+        return left.matchClass.rank - right.matchClass.rank;
+      }
+      if (analysisQualityRank(right.file.analysisQuality) !== analysisQualityRank(left.file.analysisQuality)) {
+        return analysisQualityRank(right.file.analysisQuality) - analysisQualityRank(left.file.analysisQuality);
+      }
+      if (left.file.repoRelativePath !== right.file.repoRelativePath) {
+        return left.file.repoRelativePath.localeCompare(right.file.repoRelativePath);
+      }
+      if (left.symbol.startLine !== right.symbol.startLine) {
+        return left.symbol.startLine - right.symbol.startLine;
+      }
+      return left.symbol.name.localeCompare(right.symbol.name);
+    });
+
+    const totalCount = candidates.length;
+    const matches = candidates.slice(0, requestedLimit).map<SymbolLookupMatch>(({ matchClass, file, symbol }) => ({
+      symbol: symbol.name,
+      kind: symbol.kind,
+      path: file.repoRelativePath,
+      range: { startLine: symbol.startLine, endLine: symbol.endLine },
+      summary: summarizeSymbol(file, symbol.name, symbol.kind),
+      reason: matchClass.reason,
+      suggestedNextRead: buildSymbolSuggestedReads(file),
+      ...createQueryMetadata(status, file.analysisQuality),
+    }));
+
+    return {
+      query,
+      matches,
+      truncated: totalCount > requestedLimit,
+      returnedCount: matches.length,
+      totalCount,
+      ...createQueryMetadata(status, pickAggregateQuality(matches.map((match) => match.analysisQuality))),
+    };
+  }
+
+  async fileSummary(params: FileSummaryParams): Promise<FileSummaryResponse> {
+    const status = await this.assertHealthyRepo(params.repo);
+    const files = this.readMergedIndexedFiles(status);
+    const normalizedPath = normalizeRequestedRepoPath(status.repoRoot, params.path);
+    const file = files.find((entry) => entry.repoRelativePath === normalizedPath);
+
+    if (!file) {
+      throw new RequestError("invalid_request", `No indexed file summary is available for ${params.path}.`);
+    }
+
+    const relatedCandidates = collectRelatedFiles(file)
+      .sort((left, right) => left.path.localeCompare(right.path) || left.reason.localeCompare(right.reason));
+    const relatedFiles = relatedCandidates.slice(0, FILE_SUMMARY_RELATED_FILE_LIMIT);
+    const mainExports = file.exports
+      .map((entry) => ({ name: entry.exportedName, kind: entry.kind }))
+      .sort((left, right) => left.name.localeCompare(right.name) || left.kind.localeCompare(right.kind));
+    const importantRanges = file.symbols.length > 0
+      ? file.symbols
+          .map<QueryRange>((symbol) => ({ startLine: symbol.startLine, endLine: symbol.endLine }))
+          .sort((left, right) => left.startLine - right.startLine || left.endLine - right.endLine)
+      : [{ startLine: 1, endLine: Math.max(1, Math.min(file.lineCount, 3)) }];
+
+    return {
+      path: file.repoRelativePath,
+      summary: summarizeFile(file),
+      mainExports,
+      importantRanges,
+      relatedFiles,
+      relatedFilesTruncated: relatedCandidates.length > FILE_SUMMARY_RELATED_FILE_LIMIT,
+      relatedFilesReturnedCount: relatedFiles.length,
+      relatedFilesTotalCount: relatedCandidates.length,
+      ...createQueryMetadata(status, file.analysisQuality),
+    };
+  }
+
+  async impactAnalysis(params: ImpactAnalysisParams): Promise<ImpactAnalysisResponse> {
+    const status = await this.assertHealthyRepo(params.repo);
+    const files = this.readMergedIndexedFiles(status);
+    const target = params.target.trim();
+    const requestedLimit = clampPositiveInt(params.limit, IMPACT_ANALYSIS_AREA_LIMIT);
+    const targetPath = tryNormalizeRequestedRepoPath(status.repoRoot, target);
+    const normalizedTargetPath = targetPath ? files.find((file) => file.repoRelativePath === targetPath)?.repoRelativePath : null;
+
+    const areaCandidates = new Map<string, ImpactArea & { score: number }>();
+    const addArea = (candidate: ImpactArea & { score: number }) => {
+      const key = `${candidate.path}:${candidate.range?.startLine ?? 0}:${candidate.reason}`;
+      const existing = areaCandidates.get(key);
+      if (!existing || candidate.score > existing.score) {
+        areaCandidates.set(key, candidate);
+      }
+    };
+
+    for (const file of files) {
+      if (normalizedTargetPath && file.repoRelativePath === normalizedTargetPath) {
+        addArea({
+          path: file.repoRelativePath,
+          reason: "Target path matches this indexed file.",
+          summary: summarizeFile(file),
+          analysisQuality: file.analysisQuality,
+          freshness: freshnessFromStatus(status),
+          coverage: status.coverage,
+          provenance: "local",
+          score: 5,
+        });
+      }
+
+      for (const symbol of file.symbols) {
+        const match = classifySymbolMatch(target, symbol.name);
+        if (match.score === 0) {
+          continue;
+        }
+
+        addArea({
+          path: file.repoRelativePath,
+          range: { startLine: symbol.startLine, endLine: symbol.endLine },
+          reason: `Symbol ${symbol.name} ${match.reason.toLowerCase()}`,
+          summary: summarizeSymbol(file, symbol.name, symbol.kind),
+          analysisQuality: file.analysisQuality,
+          freshness: freshnessFromStatus(status),
+          coverage: status.coverage,
+          provenance: "local",
+          score: 10 + match.score,
+        });
+      }
+
+      const importsTarget = normalizedTargetPath
+        ? file.imports.some((entry) => resolveModulePath(file.repoRelativePath, entry.moduleSpecifier) === normalizedTargetPath)
+        : false;
+      if (importsTarget) {
+        addArea({
+          path: file.repoRelativePath,
+          reason: `Imports ${normalizedTargetPath}.`,
+          summary: summarizeFile(file),
+          analysisQuality: file.analysisQuality,
+          freshness: freshnessFromStatus(status),
+          coverage: status.coverage,
+          provenance: "local",
+          score: 7,
+        });
+      }
+
+      const referencesTarget = file.references.some((entry) => entry.name.toLowerCase() === target.toLowerCase());
+      if (referencesTarget) {
+        addArea({
+          path: file.repoRelativePath,
+          reason: `Contains references to ${target}.`,
+          summary: summarizeFile(file),
+          analysisQuality: file.analysisQuality,
+          freshness: freshnessFromStatus(status),
+          coverage: status.coverage,
+          provenance: "local",
+          score: 6,
+        });
+      }
+    }
+
+    const sortedAreas = [...areaCandidates.values()]
+      .sort((left, right) => {
+        if (right.score !== left.score) {
+          return right.score - left.score;
+        }
+        if (analysisQualityRank(right.analysisQuality) !== analysisQualityRank(left.analysisQuality)) {
+          return analysisQualityRank(right.analysisQuality) - analysisQualityRank(left.analysisQuality);
+        }
+        if (left.path !== right.path) {
+          return left.path.localeCompare(right.path);
+        }
+        return (left.range?.startLine ?? 0) - (right.range?.startLine ?? 0);
+      })
+      .map(({ score: _score, ...area }) => area);
+
+    const areas = sortedAreas.slice(0, requestedLimit);
+    const suggestedReadsAll = dedupeStrings(areas.map((area) => area.path));
+    const suggestedNextRead = suggestedReadsAll.slice(0, IMPACT_ANALYSIS_SUGGESTED_READ_LIMIT);
+    const quality = pickAggregateQuality(areas.map((area) => area.analysisQuality));
+
+    return {
+      target,
+      areas,
+      reason: buildImpactReason(target, normalizedTargetPath, areas.length),
+      risk: classifyImpactRisk(areas.length, quality),
+      suggestedNextRead,
+      areasTruncated: sortedAreas.length > requestedLimit,
+      areasReturnedCount: areas.length,
+      areasTotalCount: sortedAreas.length,
+      suggestedNextReadTruncated: suggestedReadsAll.length > IMPACT_ANALYSIS_SUGGESTED_READ_LIMIT,
+      suggestedNextReadReturnedCount: suggestedNextRead.length,
+      suggestedNextReadTotalCount: suggestedReadsAll.length,
+      ...createQueryMetadata(status, quality),
+    };
   }
 
   private scheduleIndex(runtime: RepoRuntime, locator: RepoLocator, trigger: "enable" | "reindex"): void {
@@ -677,6 +942,12 @@ class SocketDaemonServer implements DaemonServer {
         return this.getRepoDiagnostics(this.assertRepoLocator(params));
       case "reindexRepo":
         return this.reindexRepo(this.assertRepoLocator(params));
+      case "symbolLookup":
+        return this.symbolLookup(this.assertSymbolLookupParams(params));
+      case "fileSummary":
+        return this.fileSummary(this.assertFileSummaryParams(params));
+      case "impactAnalysis":
+        return this.impactAnalysis(this.assertImpactAnalysisParams(params));
       default:
         throw new RequestError("unknown_method", `Unknown daemon method: ${String(method)}`);
     }
@@ -707,6 +978,79 @@ class SocketDaemonServer implements DaemonServer {
       worktreeId: candidate.worktreeId,
       headCommit: typeof candidate.headCommit === "string" ? candidate.headCommit : null,
     };
+  }
+
+  private assertSymbolLookupParams(params: unknown): SymbolLookupParams {
+    if (!params || typeof params !== "object") {
+      throw new RequestError("invalid_request", "symbolLookup requires a repo locator and non-empty symbol.");
+    }
+
+    const candidate = params as Partial<SymbolLookupParams>;
+    if (typeof candidate.symbol !== "string" || candidate.symbol.trim().length === 0) {
+      throw new RequestError("invalid_request", "symbolLookup requires a non-empty `symbol` string.");
+    }
+
+    return {
+      repo: this.assertRepoLocator(candidate.repo),
+      symbol: candidate.symbol,
+      limit: typeof candidate.limit === "number" ? candidate.limit : undefined,
+    };
+  }
+
+  private assertFileSummaryParams(params: unknown): FileSummaryParams {
+    if (!params || typeof params !== "object") {
+      throw new RequestError("invalid_request", "fileSummary requires a repo locator and file path.");
+    }
+
+    const candidate = params as Partial<FileSummaryParams>;
+    if (typeof candidate.path !== "string" || candidate.path.trim().length === 0) {
+      throw new RequestError("invalid_request", "fileSummary requires a non-empty `path` string.");
+    }
+
+    return {
+      repo: this.assertRepoLocator(candidate.repo),
+      path: candidate.path,
+    };
+  }
+
+  private assertImpactAnalysisParams(params: unknown): ImpactAnalysisParams {
+    if (!params || typeof params !== "object") {
+      throw new RequestError("invalid_request", "impactAnalysis requires a repo locator and non-empty target.");
+    }
+
+    const candidate = params as Partial<ImpactAnalysisParams>;
+    if (typeof candidate.target !== "string" || candidate.target.trim().length === 0) {
+      throw new RequestError("invalid_request", "impactAnalysis requires a non-empty `target` string.");
+    }
+
+    return {
+      repo: this.assertRepoLocator(candidate.repo),
+      target: candidate.target,
+      limit: typeof candidate.limit === "number" ? candidate.limit : undefined,
+    };
+  }
+
+  private async assertHealthyRepo(locator: RepoLocator): Promise<RepoStatus> {
+    await this.openRepo(locator);
+    const status = await this.getStatus(locator);
+    if (!status.enabled || status.state === "disabled" || status.state === "error") {
+      throw new RequestError(
+        "repo_not_enabled",
+        "The current working directory is not inside an enabled, healthy indexed repository. Run `/index enable`, or `/index doctor` if the repo is in error.",
+      );
+    }
+    return status;
+  }
+
+  private readMergedIndexedFiles(status: RepoStatus): IndexedFileView[] {
+    const merged = new Map<string, IndexedFileView>();
+    for (const file of readIndexedFiles(status.baseline.dbPath)) {
+      merged.set(file.repoRelativePath, file);
+    }
+    for (const file of readIndexedFiles(status.overlay.dbPath)) {
+      merged.set(file.repoRelativePath, file);
+    }
+    return [...merged.values()].sort((left, right) => left.repoRelativePath.localeCompare(right.repoRelativePath));
   }
 
   private successResponse<TResult>(id: string, result: TResult): DaemonSuccessResponse<TResult> {
@@ -812,6 +1156,275 @@ class SocketDaemonServer implements DaemonServer {
       rm(this.runtimePaths.pidFile, { force: true }).catch(() => undefined),
     ]);
   }
+}
+
+function readIndexedFiles(dbPath: string): IndexedFileView[] {
+  const db = new DatabaseSync(dbPath, { open: true, readOnly: true });
+
+  try {
+    const files = new Map<string, IndexedFileView>();
+    const fileRows = db.prepare("SELECT repo_relative_path, language, analysis_quality, line_count, summary_json FROM file_index ORDER BY repo_relative_path").all() as Array<{
+      repo_relative_path: string;
+      language: string;
+      analysis_quality: AnalysisQuality;
+      line_count: number;
+      summary_json: string;
+    }>;
+
+    for (const row of fileRows) {
+      files.set(row.repo_relative_path, {
+        repoRelativePath: row.repo_relative_path,
+        language: row.language,
+        analysisQuality: row.analysis_quality,
+        lineCount: row.line_count,
+        summary: JSON.parse(row.summary_json) as IndexedFileView["summary"],
+        symbols: [],
+        imports: [],
+        exports: [],
+        references: [],
+      });
+    }
+
+    const symbolRows = db.prepare("SELECT repo_relative_path, name, kind, start_line, end_line, exported FROM symbols ORDER BY repo_relative_path, start_line, name").all() as Array<{
+      repo_relative_path: string;
+      name: string;
+      kind: string;
+      start_line: number;
+      end_line: number;
+      exported: number;
+    }>;
+    for (const row of symbolRows) {
+      files.get(row.repo_relative_path)?.symbols.push({
+        name: row.name,
+        kind: row.kind,
+        startLine: row.start_line,
+        endLine: row.end_line,
+        exported: row.exported === 1,
+      });
+    }
+
+    const importRows = db.prepare("SELECT repo_relative_path, module_specifier, imported_name, local_name, is_type_only FROM imports ORDER BY repo_relative_path, module_specifier, imported_name, local_name").all() as Array<{
+      repo_relative_path: string;
+      module_specifier: string;
+      imported_name: string;
+      local_name: string;
+      is_type_only: number;
+    }>;
+    for (const row of importRows) {
+      files.get(row.repo_relative_path)?.imports.push({
+        moduleSpecifier: row.module_specifier,
+        importedName: row.imported_name,
+        localName: row.local_name,
+        isTypeOnly: row.is_type_only === 1,
+      });
+    }
+
+    const exportRows = db.prepare("SELECT repo_relative_path, exported_name, kind, module_specifier FROM exports ORDER BY repo_relative_path, exported_name, kind").all() as Array<{
+      repo_relative_path: string;
+      exported_name: string;
+      kind: string;
+      module_specifier: string | null;
+    }>;
+    for (const row of exportRows) {
+      files.get(row.repo_relative_path)?.exports.push({
+        exportedName: row.exported_name,
+        kind: row.kind,
+        moduleSpecifier: row.module_specifier ?? undefined,
+      });
+    }
+
+    const referenceRows = db.prepare("SELECT repo_relative_path, name, line, column FROM references_idx ORDER BY repo_relative_path, line, column, name").all() as Array<{
+      repo_relative_path: string;
+      name: string;
+      line: number;
+      column: number;
+    }>;
+    for (const row of referenceRows) {
+      files.get(row.repo_relative_path)?.references.push({
+        name: row.name,
+        line: row.line,
+        column: row.column,
+      });
+    }
+
+    return [...files.values()].sort((left, right) => left.repoRelativePath.localeCompare(right.repoRelativePath));
+  } finally {
+    db.close();
+  }
+}
+
+function createQueryMetadata(status: RepoStatus, analysisQuality: AnalysisQuality): QueryMetadata {
+  return {
+    freshness: freshnessFromStatus(status),
+    coverage: status.coverage,
+    provenance: "local" satisfies ResultProvenance,
+    analysisQuality,
+  };
+}
+
+function freshnessFromStatus(status: RepoStatus): RepoFreshness {
+  switch (status.state) {
+    case "ready":
+      return "current";
+    case "stale":
+      return "stale";
+    case "error":
+      return "error";
+    default:
+      return "not-yet-indexed";
+  }
+}
+
+function analysisQualityRank(quality: AnalysisQuality): number {
+  switch (quality) {
+    case "semantic":
+      return 3;
+    case "structural":
+      return 2;
+    case "basic":
+    default:
+      return 1;
+  }
+}
+
+function pickAggregateQuality(qualities: AnalysisQuality[]): AnalysisQuality {
+  return qualities.sort((left, right) => analysisQualityRank(right) - analysisQualityRank(left))[0] ?? "basic";
+}
+
+function clampPositiveInt(value: number | undefined, fallback: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    return fallback;
+  }
+
+  return Math.min(Math.floor(value), fallback);
+}
+
+function classifySymbolMatch(query: string, symbol: string): { score: number; rank: number; reason: string } {
+  const normalizedQuery = query.trim().toLowerCase();
+  const normalizedSymbol = symbol.toLowerCase();
+
+  if (normalizedQuery.length === 0) {
+    return { score: 0, rank: 99, reason: "No symbol query was provided." };
+  }
+  if (normalizedSymbol === normalizedQuery) {
+    return { score: 3, rank: 1, reason: `Matched symbol name exactly for ${symbol}.` };
+  }
+  if (normalizedSymbol.startsWith(normalizedQuery)) {
+    return { score: 2, rank: 2, reason: `Matched symbol name prefix for ${symbol}.` };
+  }
+  if (normalizedSymbol.includes(normalizedQuery)) {
+    return { score: 1, rank: 3, reason: `Matched symbol name substring for ${symbol}.` };
+  }
+
+  return { score: 0, rank: 99, reason: `No symbol match for ${symbol}.` };
+}
+
+function summarizeSymbol(file: IndexedFileView, symbol: string, kind: string): string {
+  return `${kind} ${symbol} in ${file.repoRelativePath} (${file.language}, ${file.summary.lineCount} lines).`;
+}
+
+function buildSymbolSuggestedReads(file: IndexedFileView): string[] {
+  const reads = [
+    file.repoRelativePath,
+    ...collectRelatedFiles(file).map((entry) => entry.path),
+  ];
+  return dedupeStrings(reads).slice(0, IMPACT_ANALYSIS_SUGGESTED_READ_LIMIT);
+}
+
+function summarizeFile(file: IndexedFileView): string {
+  if (file.analysisQuality === "structural") {
+    return `${file.language} file with ${file.symbols.length} symbols, ${file.imports.length} imports, and ${file.exports.length} exports. Preview: ${file.summary.preview || "n/a"}`;
+  }
+
+  return `${file.language} fallback summary (${file.summary.lineCount} lines). Preview: ${file.summary.preview || "n/a"}`;
+}
+
+function collectRelatedFiles(file: IndexedFileView): Array<{ path: string; reason: string }> {
+  const related = new Map<string, { path: string; reason: string }>();
+  for (const entry of file.imports) {
+    const resolvedPath = resolveModulePath(file.repoRelativePath, entry.moduleSpecifier);
+    if (!resolvedPath) {
+      continue;
+    }
+    related.set(`${resolvedPath}:import`, { path: resolvedPath, reason: `Imports ${entry.moduleSpecifier}.` });
+  }
+  for (const entry of file.exports) {
+    if (!entry.moduleSpecifier) {
+      continue;
+    }
+    const resolvedPath = resolveModulePath(file.repoRelativePath, entry.moduleSpecifier);
+    if (!resolvedPath) {
+      continue;
+    }
+    related.set(`${resolvedPath}:export`, { path: resolvedPath, reason: `Re-exports ${entry.moduleSpecifier}.` });
+  }
+  return [...related.values()];
+}
+
+function resolveModulePath(fromRepoPath: string, moduleSpecifier: string): string | null {
+  if (!moduleSpecifier.startsWith(".")) {
+    return null;
+  }
+
+  const baseDir = fromRepoPath.includes("/") ? fromRepoPath.slice(0, fromRepoPath.lastIndexOf("/")) : "";
+  const segments = `${baseDir}/${moduleSpecifier}`.split("/");
+  const normalizedSegments: string[] = [];
+
+  for (const segment of segments) {
+    if (!segment || segment === ".") {
+      continue;
+    }
+    if (segment === "..") {
+      normalizedSegments.pop();
+      continue;
+    }
+    normalizedSegments.push(segment);
+  }
+
+  const normalized = normalizedSegments.join("/");
+  return /\.[a-z0-9]+$/i.test(normalized) ? normalized : `${normalized}.ts`;
+}
+
+function normalizeRequestedRepoPath(repoRoot: string, requestedPath: string): string {
+  const normalized = tryNormalizeRequestedRepoPath(repoRoot, requestedPath);
+  if (!normalized) {
+    throw new RequestError("invalid_request", `Path ${requestedPath} is outside the repository boundary.`);
+  }
+  return normalized;
+}
+
+function tryNormalizeRequestedRepoPath(repoRoot: string, requestedPath: string): string | null {
+  if (requestedPath.startsWith("/")) {
+    return normalizeRepoRelative(repoRoot, requestedPath);
+  }
+
+  const sanitized = requestedPath.replace(/^\.\//, "");
+  if (sanitized.startsWith("../")) {
+    return null;
+  }
+
+  return sanitized.replace(/\\/g, "/");
+}
+
+function dedupeStrings(values: string[]): string[] {
+  return [...new Set(values.filter((value) => value.length > 0))];
+}
+
+function buildImpactReason(target: string, normalizedTargetPath: string | null, areaCount: number): string {
+  if (normalizedTargetPath) {
+    return `Impact analysis traced ${areaCount} indexed area(s) related to path ${normalizedTargetPath}.`;
+  }
+  return `Impact analysis traced ${areaCount} indexed area(s) related to symbol or target ${target}.`;
+}
+
+function classifyImpactRisk(areaCount: number, quality: AnalysisQuality): "low" | "medium" | "high" {
+  if (areaCount >= 6 || quality === "basic") {
+    return "high";
+  }
+  if (areaCount >= 3) {
+    return "medium";
+  }
+  return "low";
 }
 
 async function canConnect(socketPath: string): Promise<boolean> {

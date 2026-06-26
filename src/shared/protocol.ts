@@ -9,6 +9,10 @@ export const INDEXER_LANGUAGE_ADAPTER_SET = [
   "javascript",
   "fallback-basic",
 ] as const;
+export const SYMBOL_LOOKUP_MATCH_LIMIT = 10 as const;
+export const FILE_SUMMARY_RELATED_FILE_LIMIT = 5 as const;
+export const IMPACT_ANALYSIS_AREA_LIMIT = 10 as const;
+export const IMPACT_ANALYSIS_SUGGESTED_READ_LIMIT = 5 as const;
 
 export type RepoIndexingState =
   | "disabled"
@@ -31,7 +35,10 @@ export type DaemonMethod =
   | "disableRepoIndexing"
   | "getStatus"
   | "getRepoDiagnostics"
-  | "reindexRepo";
+  | "reindexRepo"
+  | "symbolLookup"
+  | "fileSummary"
+  | "impactAnalysis";
 
 export interface CoverageMetadata {
   eligibleFiles: number;
@@ -53,6 +60,24 @@ export interface RepoLocator {
   gitDir: string;
   worktreeId: string;
   headCommit: string | null;
+}
+
+export interface QueryRange {
+  startLine: number;
+  endLine: number;
+}
+
+export interface QueryMetadata {
+  freshness: RepoFreshness;
+  coverage: CoverageMetadata;
+  provenance: ResultProvenance;
+  analysisQuality: AnalysisQuality;
+}
+
+export interface QueryTruncationMetadata {
+  truncated: boolean;
+  returnedCount: number;
+  totalCount?: number;
 }
 
 export interface HealthResponse {
@@ -136,6 +161,80 @@ export interface OpenRepoResponse {
   state: RepoIndexingState;
   baseline: StoreAnchor;
   overlay: StoreAnchor;
+}
+
+export interface SymbolLookupParams {
+  repo: RepoLocator;
+  symbol: string;
+  limit?: number;
+}
+
+export interface SymbolLookupMatch extends QueryMetadata {
+  symbol: string;
+  kind: string;
+  path: string;
+  range: QueryRange;
+  summary: string;
+  reason: string;
+  suggestedNextRead: string[];
+}
+
+export interface SymbolLookupResponse extends QueryMetadata, QueryTruncationMetadata {
+  query: string;
+  matches: SymbolLookupMatch[];
+}
+
+export interface FileSummaryParams {
+  repo: RepoLocator;
+  path: string;
+}
+
+export interface FileSummaryExport {
+  name: string;
+  kind: string;
+}
+
+export interface FileSummaryRelatedFile {
+  path: string;
+  reason: string;
+}
+
+export interface FileSummaryResponse extends QueryMetadata {
+  path: string;
+  summary: string;
+  mainExports: FileSummaryExport[];
+  importantRanges: QueryRange[];
+  relatedFiles: FileSummaryRelatedFile[];
+  relatedFilesTruncated: boolean;
+  relatedFilesReturnedCount: number;
+  relatedFilesTotalCount?: number;
+}
+
+export interface ImpactAnalysisParams {
+  repo: RepoLocator;
+  target: string;
+  limit?: number;
+}
+
+export interface ImpactArea extends QueryMetadata {
+  path: string;
+  range?: QueryRange;
+  reason: string;
+  summary: string;
+}
+
+export interface ImpactAnalysisResponse extends QueryMetadata {
+  target: string;
+  areas: ImpactArea[];
+  reason: string;
+  risk: "low" | "medium" | "high";
+  suggestedNextRead: string[];
+  areasTruncated: boolean;
+  areasReturnedCount: number;
+  areasTotalCount?: number;
+  suggestedNextReadTruncated: boolean;
+  suggestedNextReadReturnedCount: number;
+  suggestedNextReadTotalCount?: number;
 }
 
 export interface DaemonRequest<TParams = unknown> {

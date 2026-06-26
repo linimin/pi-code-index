@@ -13,11 +13,17 @@ import {
   type DaemonRequest,
   type DaemonResponse,
   type DaemonWireError,
+  type FileSummaryParams,
+  type FileSummaryResponse,
   type HealthResponse,
+  type ImpactAnalysisParams,
+  type ImpactAnalysisResponse,
   type OpenRepoResponse,
   type RepoDiagnostics,
   type RepoLocator,
   type RepoStatus,
+  type SymbolLookupParams,
+  type SymbolLookupResponse,
 } from "../shared/protocol.ts";
 
 const execFileAsync = promisify(execFile);
@@ -165,6 +171,24 @@ export class DaemonClient {
   async reindexRepo(locator: RepoLocator, options: DaemonCallOptions = {}): Promise<RepoStatus> {
     await this.ensureCompatibleDaemon(options.startIfNeeded ?? true);
     return this.rawRequest<RepoLocator, RepoStatus>("reindexRepo", locator);
+  }
+
+  async symbolLookup(params: SymbolLookupParams, options: DaemonCallOptions = {}): Promise<SymbolLookupResponse> {
+    await this.ensureCompatibleDaemon(options.startIfNeeded ?? true);
+    return this.rawRequest<SymbolLookupParams, SymbolLookupResponse>("symbolLookup", params);
+  }
+
+  async fileSummary(params: FileSummaryParams, options: DaemonCallOptions = {}): Promise<FileSummaryResponse> {
+    await this.ensureCompatibleDaemon(options.startIfNeeded ?? true);
+    return this.rawRequest<FileSummaryParams, FileSummaryResponse>("fileSummary", params);
+  }
+
+  async impactAnalysis(
+    params: ImpactAnalysisParams,
+    options: DaemonCallOptions = {},
+  ): Promise<ImpactAnalysisResponse> {
+    await this.ensureCompatibleDaemon(options.startIfNeeded ?? true);
+    return this.rawRequest<ImpactAnalysisParams, ImpactAnalysisResponse>("impactAnalysis", params);
   }
 
   private async ensureCompatibleDaemon(startIfNeeded: boolean): Promise<HealthResponse> {

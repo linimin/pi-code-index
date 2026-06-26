@@ -2,6 +2,7 @@ import {
   DEFAULT_ANALYZER_CAPABILITIES,
   createRepoRuntimeKey,
   type CoverageMetadata,
+  type DaemonLifecycleSnapshot,
   type HealthResponse,
   type OpenRepoResponse,
   type RepoDiagnostics,
@@ -225,13 +226,19 @@ export class RepoRuntime {
     };
   }
 
-  toStatus(health: HealthResponse, transport: string): RepoStatus {
+  toStatus(
+    health: HealthResponse,
+    transport: string,
+    daemonLifecycle: DaemonLifecycleSnapshot,
+    options: { runtimeLoaded?: boolean } = {},
+  ): RepoStatus {
     return {
       repoId: this.repoId,
       repoRoot: this.repoRoot,
       repoName: this.repoName,
       worktreeId: this.worktreeId,
       enabled: this.enabled,
+      runtimeLoaded: options.runtimeLoaded ?? true,
       state: this.state,
       mode: "local-daemon",
       transport,
@@ -245,12 +252,15 @@ export class RepoRuntime {
       lastError: this.lastError,
       baseline: this.baseline,
       overlay: this.overlay,
+      daemonLifecycle,
       recommendedAction: this.recommendedAction(),
     };
   }
 
-  toDiagnostics(options: RepoDiagnosticsOptions): RepoDiagnostics {
-    const status = this.toStatus(options.health, options.transport);
+  toDiagnostics(options: RepoDiagnosticsOptions & { daemonLifecycle: DaemonLifecycleSnapshot; runtimeLoaded?: boolean }): RepoDiagnostics {
+    const status = this.toStatus(options.health, options.transport, options.daemonLifecycle, {
+      runtimeLoaded: options.runtimeLoaded,
+    });
 
     return {
       ...status,

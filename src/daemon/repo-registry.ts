@@ -181,6 +181,14 @@ export class RepoRegistry {
   }
 
   listEnabled(): PersistedRepoRecord[] {
+    return this.listWhere("WHERE enabled = 1");
+  }
+
+  listAll(): PersistedRepoRecord[] {
+    return this.listWhere("");
+  }
+
+  private listWhere(whereClause: string): PersistedRepoRecord[] {
     const db = new DatabaseSync(this.dbPath, { open: true, readOnly: true });
     try {
       const rows = db.prepare(`
@@ -201,7 +209,7 @@ export class RepoRegistry {
           last_successful_index_at,
           last_error
         FROM repo_registry
-        WHERE enabled = 1
+        ${whereClause}
         ORDER BY repo_root, worktree_id
       `).all() as RegistryRow[];
       return rows.map(mapRow);

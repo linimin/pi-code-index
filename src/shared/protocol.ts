@@ -107,12 +107,38 @@ export interface StoreAnchor {
   worktreeId?: string;
 }
 
+export interface IdleShutdownStatus {
+  eligible: boolean;
+  scheduled: boolean;
+  graceMs: number;
+  deadlineAt?: string;
+  blockedBy: Array<"enabled-repos" | "active-requests" | "active-jobs">;
+}
+
+export interface RegistrySummary {
+  dbPath: string;
+  registeredRepoCount: number;
+  enabledRepoCount: number;
+  disabledRepoCount: number;
+  stateCounts: Record<RepoIndexingState, number>;
+}
+
+export interface DaemonLifecycleSnapshot {
+  enabledRepoCount: number;
+  loadedRuntimeCount: number;
+  activeRequestCount: number;
+  activeJobCount: number;
+  idleShutdown: IdleShutdownStatus;
+  registry: RegistrySummary;
+}
+
 export interface RepoStatus {
   repoId: string;
   repoRoot: string;
   repoName: string;
   worktreeId: string;
   enabled: boolean;
+  runtimeLoaded: boolean;
   state: RepoIndexingState;
   mode: "local-daemon";
   transport: string;
@@ -126,6 +152,7 @@ export interface RepoStatus {
   lastError?: string;
   baseline: StoreAnchor;
   overlay: StoreAnchor;
+  daemonLifecycle: DaemonLifecycleSnapshot;
   recommendedAction: string;
 }
 

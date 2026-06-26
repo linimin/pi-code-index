@@ -21,6 +21,7 @@ import {
   createRepoRuntimeKey,
   type AnalysisQuality,
   type DaemonErrorResponse,
+  type DaemonLifecycleSnapshot,
   type DaemonMethod,
   type DaemonRequest,
   type DaemonResponse,
@@ -187,6 +188,7 @@ class SocketDaemonServer implements DaemonServer {
   private started = false;
   private activeRequests = 0;
   private idleShutdownTimer?: NodeJS.Timeout;
+  private idleShutdownDeadlineAt?: string;
   private idleShutdownInFlight = false;
 
   constructor(options: DaemonServerOptions) {
@@ -256,6 +258,7 @@ class SocketDaemonServer implements DaemonServer {
       clearTimeout(this.idleShutdownTimer);
       this.idleShutdownTimer = undefined;
     }
+    this.idleShutdownDeadlineAt = undefined;
 
     for (const job of this.jobs.values()) {
       if (job.timer) {
@@ -323,25 +326,24 @@ class SocketDaemonServer implements DaemonServer {
     await this.registry.markEnabled(locator, runtime.repoId);
     await this.syncRegistryFromRuntime(locator, runtime);
     this.scheduleIndex(runtime, locator, "enable");
-    return runtime.toStatus(this.health(), asUnixTransport(this.options.socketPath));
+    return this.buildStatus(runtime, { runtimeLoaded: true });
   }
 
   async disableRepoIndexing(locator: RepoLocator): Promise<RepoStatus> {
     const runtime = await this.ensureRuntime(locator);
     runtime.disable();
-    const status = runtime.toStatus(this.health(), asUnixTransport(this.options.socketPath));
     this.cancelJob(runtime.key);
     await this.registry.markDisabled(locator, runtime.repoId);
     await this.syncRegistryFromRuntime(locator, runtime);
     this.runtimes.delete(runtime.key);
     this.updateIdleShutdownState();
-    return status;
+    return this.buildStatus(runtime, { runtimeLoaded: false });
   }
 
   async getStatus(locator: RepoLocator): Promise<RepoStatus> {
     const runtime = await this.ensureRuntime(locator);
     await this.refreshRuntimeProjection(runtime, locator);
-    return runtime.toStatus(this.health(), asUnixTransport(this.options.socketPath));
+    return this.buildStatus(runtime, { runtimeLoaded: this.runtimes.has(runtime.key) });
   }
 
   async getRepoDiagnostics(locator: RepoLocator): Promise<RepoDiagnostics> {
@@ -353,6 +355,8 @@ class SocketDaemonServer implements DaemonServer {
     return runtime.toDiagnostics({
       health: this.health(),
       transport: asUnixTransport(this.options.socketPath),
+      daemonLifecycle: this.buildDaemonLifecycleSnapshot(),
+      runtimeLoaded: this.runtimes.has(runtime.key),
       storageSummary,
       queueDepth: job?.active || job?.queued ? 1 : 0,
       activeJobs: job?.active ? ["index-rebuild"] : [],
@@ -363,7 +367,7 @@ class SocketDaemonServer implements DaemonServer {
     const runtime = await this.ensureRuntime(locator);
     runtime.reindex();
     this.scheduleIndex(runtime, locator, "reindex");
-    return runtime.toStatus(this.health(), asUnixTransport(this.options.socketPath));
+    return this.buildStatus(runtime, { runtimeLoaded: true });
   }
 
   async symbolLookup(params: SymbolLookupParams): Promise<SymbolLookupResponse> {
@@ -1125,6 +1129,78 @@ class SocketDaemonServer implements DaemonServer {
     return [...merged.values()].sort((left, right) => left.repoRelativePath.localeCompare(right.repoRelativePath));
   }
 
+  private buildStatus(runtime: RepoRuntime, options: { runtimeLoaded: boolean }): RepoStatus {
+    return runtime.toStatus(
+      this.health(),
+      asUnixTransport(this.options.socketPath),
+      this.buildDaemonLifecycleSnapshot(),
+      options,
+    );
+  }
+
+  private buildDaemonLifecycleSnapshot(): DaemonLifecycleSnapshot {
+    const registeredRepos = this.registry.listAll();
+    const enabledRepoCount = registeredRepos.filter((record) => record.enabled).length;
+    const stateCounts = {
+      disabled: 0,
+      initializing: 0,
+      indexing: 0,
+      ready: 0,
+      stale: 0,
+      error: 0,
+    } satisfies DaemonLifecycleSnapshot["registry"]["stateCounts"];
+
+    for (const record of registeredRepos) {
+      stateCounts[record.state] += 1;
+    }
+
+    return {
+      enabledRepoCount,
+      loadedRuntimeCount: this.runtimes.size,
+      activeRequestCount: this.activeRequests,
+      activeJobCount: this.countActiveJobs(),
+      idleShutdown: this.getIdleShutdownStatus(enabledRepoCount),
+      registry: {
+        dbPath: this.runtimePaths.registryDbPath,
+        registeredRepoCount: registeredRepos.length,
+        enabledRepoCount,
+        disabledRepoCount: registeredRepos.length - enabledRepoCount,
+        stateCounts,
+      },
+    };
+  }
+
+  private countActiveJobs(): number {
+    let count = 0;
+    for (const job of this.jobs.values()) {
+      if (job.active || job.queued || job.timer) {
+        count += 1;
+      }
+    }
+    return count;
+  }
+
+  private getIdleShutdownStatus(enabledRepoCount = this.registry.listEnabled().length): DaemonLifecycleSnapshot["idleShutdown"] {
+    const blockedBy: DaemonLifecycleSnapshot["idleShutdown"]["blockedBy"] = [];
+    if (enabledRepoCount > 0) {
+      blockedBy.push("enabled-repos");
+    }
+    if (this.activeRequests > 0) {
+      blockedBy.push("active-requests");
+    }
+    if (this.hasActiveOrQueuedJobs()) {
+      blockedBy.push("active-jobs");
+    }
+
+    return {
+      eligible: blockedBy.length === 0,
+      scheduled: this.idleShutdownTimer !== undefined,
+      graceMs: this.idleShutdownGraceMs,
+      deadlineAt: this.idleShutdownDeadlineAt,
+      blockedBy,
+    };
+  }
+
   private successResponse<TResult>(id: string, result: TResult): DaemonSuccessResponse<TResult> {
     return {
       id,
@@ -1277,6 +1353,7 @@ class SocketDaemonServer implements DaemonServer {
         clearTimeout(this.idleShutdownTimer);
         this.idleShutdownTimer = undefined;
       }
+      this.idleShutdownDeadlineAt = undefined;
       return;
     }
 
@@ -1284,8 +1361,10 @@ class SocketDaemonServer implements DaemonServer {
       return;
     }
 
+    this.idleShutdownDeadlineAt = new Date(Date.now() + this.idleShutdownGraceMs).toISOString();
     this.idleShutdownTimer = setTimeout(() => {
       this.idleShutdownTimer = undefined;
+      this.idleShutdownDeadlineAt = undefined;
       void this.performIdleShutdown();
     }, this.idleShutdownGraceMs);
   }

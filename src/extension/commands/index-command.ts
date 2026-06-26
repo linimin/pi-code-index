@@ -194,11 +194,15 @@ function formatStatusMessage(status: RepoStatus): string {
     `Root: ${status.repoRoot}`,
     `Worktree ID: ${status.worktreeId}`,
     `Enabled: ${status.enabled ? "yes" : "no"}`,
+    `Runtime loaded: ${status.runtimeLoaded ? "yes" : "no"}`,
     `State: ${status.state}`,
     `Mode: ${status.mode}`,
     `Indexed files: ${status.indexedFiles}`,
     `Pending files: ${status.filesPending}`,
     `Coverage: ${formatCoverage(status.coverage)}`,
+    `Daemon lifecycle: enabledRepos=${status.daemonLifecycle.enabledRepoCount}, loadedRuntimes=${status.daemonLifecycle.loadedRuntimeCount}, activeRequests=${status.daemonLifecycle.activeRequestCount}, activeJobs=${status.daemonLifecycle.activeJobCount}`,
+    `Idle shutdown: ${formatIdleShutdown(status.daemonLifecycle.idleShutdown)}`,
+    `Registry: registered=${status.daemonLifecycle.registry.registeredRepoCount}, enabled=${status.daemonLifecycle.registry.enabledRepoCount}, disabled=${status.daemonLifecycle.registry.disabledRepoCount}`,
     `HEAD baseline: ${status.headCommit ?? "unborn HEAD"}`,
     `Baseline DB: ${status.baseline.dbPath}`,
     `Overlay DB: ${status.overlay.dbPath}`,
@@ -223,9 +227,15 @@ function formatDoctorMessage(diagnostics: RepoDiagnostics): string {
     `Repo root: ${diagnostics.repoRoot}`,
     `Git dir: ${diagnostics.repoIdentity.gitDir}`,
     `Worktree ID: ${diagnostics.worktreeId}`,
+    `Enabled: ${diagnostics.enabled ? "yes" : "no"}`,
+    `Runtime loaded: ${diagnostics.runtimeLoaded ? "yes" : "no"}`,
     `State: ${diagnostics.state}`,
     `Freshness: ${diagnostics.freshness}`,
     `Coverage: ${formatCoverage(diagnostics.coverage)}`,
+    `Daemon lifecycle: enabledRepos=${diagnostics.daemonLifecycle.enabledRepoCount}, loadedRuntimes=${diagnostics.daemonLifecycle.loadedRuntimeCount}, activeRequests=${diagnostics.daemonLifecycle.activeRequestCount}, activeJobs=${diagnostics.daemonLifecycle.activeJobCount}`,
+    `Idle shutdown: ${formatIdleShutdown(diagnostics.daemonLifecycle.idleShutdown)}`,
+    `Registry: db=${diagnostics.daemonLifecycle.registry.dbPath}, registered=${diagnostics.daemonLifecycle.registry.registeredRepoCount}, enabled=${diagnostics.daemonLifecycle.registry.enabledRepoCount}, disabled=${diagnostics.daemonLifecycle.registry.disabledRepoCount}`,
+    `Registry states: ${formatRegistryStateCounts(diagnostics.daemonLifecycle.registry.stateCounts)}`,
     `Analyzers: ${formatAnalyzerCapabilities(diagnostics.analyzerCapabilities)}`,
     `Queue depth: ${diagnostics.queueDepth}`,
     `Active jobs: ${diagnostics.activeJobs.length > 0 ? diagnostics.activeJobs.join(", ") : "none"}`,
@@ -242,6 +252,19 @@ function formatDoctorMessage(diagnostics: RepoDiagnostics): string {
 
 function formatCoverage(coverage: RepoStatus["coverage"]): string {
   return `${coverage.indexedFiles}/${coverage.eligibleFiles} (${coverage.indexedPercent}%)`;
+}
+
+function formatIdleShutdown(idleShutdown: RepoStatus["daemonLifecycle"]["idleShutdown"]): string {
+  const blocked = idleShutdown.blockedBy.length > 0 ? idleShutdown.blockedBy.join(",") : "none";
+  const deadline = idleShutdown.deadlineAt ? `, deadline=${idleShutdown.deadlineAt}` : "";
+  return `eligible=${idleShutdown.eligible ? "yes" : "no"}, scheduled=${idleShutdown.scheduled ? "yes" : "no"}, graceMs=${idleShutdown.graceMs}, blockedBy=${blocked}${deadline}`;
+}
+
+function formatRegistryStateCounts(stateCounts: RepoStatus["daemonLifecycle"]["registry"]["stateCounts"]): string {
+  return Object.entries(stateCounts)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([state, count]) => `${state}=${count}`)
+    .join(", ");
 }
 
 function formatAnalyzerCapabilities(analyzers: RepoDiagnostics["analyzerCapabilities"]): string {

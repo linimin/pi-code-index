@@ -40,6 +40,13 @@ test("indexing pipeline persists structural and fallback analysis with truthful 
 
   const diagnostics = await server.getRepoDiagnostics(repo);
   assert.equal(diagnostics.freshness, "current");
+  assert.equal(diagnostics.runtimeLoaded, true);
+  assert.equal(diagnostics.daemonLifecycle.enabledRepoCount, 1);
+  assert.equal(diagnostics.daemonLifecycle.loadedRuntimeCount, 1);
+  assert.equal(diagnostics.daemonLifecycle.registry.registeredRepoCount, 1);
+  assert.equal(diagnostics.daemonLifecycle.registry.enabledRepoCount, 1);
+  assert.equal(diagnostics.daemonLifecycle.idleShutdown.eligible, false);
+  assert.deepEqual(diagnostics.daemonLifecycle.idleShutdown.blockedBy.includes("enabled-repos"), true);
   assert.equal(diagnostics.storageSummary.baselineCount, 1);
   assert.equal(diagnostics.storageSummary.overlayBytes > 0, true);
 
@@ -81,6 +88,12 @@ test("indexing pipeline persists structural and fallback analysis with truthful 
 
   status = await server.disableRepoIndexing(repo);
   assert.equal(status.state, "disabled");
+  assert.equal(status.runtimeLoaded, false);
+  assert.equal(status.daemonLifecycle.enabledRepoCount, 0);
+  assert.equal(status.daemonLifecycle.loadedRuntimeCount, 0);
+  assert.equal(status.daemonLifecycle.idleShutdown.eligible, true);
+  assert.equal(status.daemonLifecycle.idleShutdown.scheduled, true);
+  assert.match(status.daemonLifecycle.idleShutdown.deadlineAt ?? "", /T/);
   assert.equal(await pathExists(status.baseline.dbPath), true);
   assert.equal(await pathExists(status.overlay.dbPath), true);
 
@@ -121,7 +134,10 @@ test("registry persists enabled repo lifecycle across daemon restart", async (t)
 
   assert.equal(restoredOpen.enabled, true);
   assert.equal(restoredStatus.enabled, true);
+  assert.equal(restoredStatus.runtimeLoaded, true);
   assert.notEqual(restoredStatus.state, "disabled");
+  assert.equal(restoredStatus.daemonLifecycle.enabledRepoCount, 1);
+  assert.equal(restoredStatus.daemonLifecycle.loadedRuntimeCount, 1);
   assert.equal(restoredStatus.repoId, readyStatus.repoId);
   assert.equal(restoredStatus.baseline.dbPath, readyStatus.baseline.dbPath);
   assert.equal(restoredStatus.overlay.dbPath, readyStatus.overlay.dbPath);
@@ -136,7 +152,10 @@ test("registry persists enabled repo lifecycle across daemon restart", async (t)
   const otherRepo = await resolveRepoLocator(otherRepoDir);
   const otherStatus = await secondServer.getStatus(otherRepo);
   assert.equal(otherStatus.enabled, false);
+  assert.equal(otherStatus.runtimeLoaded, true);
   assert.equal(otherStatus.state, "disabled");
+  assert.equal(otherStatus.daemonLifecycle.registry.registeredRepoCount, 2);
+  assert.equal(otherStatus.daemonLifecycle.registry.enabledRepoCount, 1);
 });
 
 test("failed reindex transitions to error when repo access breaks", async (t) => {

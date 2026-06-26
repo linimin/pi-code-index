@@ -138,6 +138,10 @@ test("/index enable -> /index status -> /index doctor uses real daemon state and
   assert.equal(statusNotifications.length, 1);
   assert.match(statusNotifications[0]?.message ?? "", /pi-code-index status/);
   assert.match(statusNotifications[0]?.message ?? "", /Enabled: yes/);
+  assert.match(statusNotifications[0]?.message ?? "", /Runtime loaded: yes/);
+  assert.match(statusNotifications[0]?.message ?? "", /Daemon lifecycle: /);
+  assert.match(statusNotifications[0]?.message ?? "", /Idle shutdown: /);
+  assert.match(statusNotifications[0]?.message ?? "", /Registry: registered=1, enabled=1, disabled=0/);
   assert.match(statusNotifications[0]?.message ?? "", new RegExp(escapeRegExp(repo.repoRoot)));
   assert.match(statusNotifications[0]?.message ?? "", new RegExp(escapeRegExp(repo.worktreeId)));
   assert.match(statusNotifications[0]?.message ?? "", /Transport: unix:\/\//);
@@ -148,11 +152,19 @@ test("/index enable -> /index status -> /index doctor uses real daemon state and
   assert.match(doctorNotifications[0]?.message ?? "", new RegExp(`Protocol version: ${DAEMON_PROTOCOL_VERSION}`));
   assert.match(doctorNotifications[0]?.message ?? "", new RegExp(`Repo ID: ${expectedRepoId}`));
   assert.match(doctorNotifications[0]?.message ?? "", /Daemon running: yes/);
+  assert.match(doctorNotifications[0]?.message ?? "", /Runtime loaded: yes/);
+  assert.match(doctorNotifications[0]?.message ?? "", /Daemon lifecycle: /);
+  assert.match(doctorNotifications[0]?.message ?? "", /Idle shutdown: /);
+  assert.match(doctorNotifications[0]?.message ?? "", /Registry: db=.*repo-registry\.sqlite, registered=1, enabled=1, disabled=0/);
+  assert.match(doctorNotifications[0]?.message ?? "", /Registry states: /);
   assert.match(doctorNotifications[0]?.message ?? "", /Storage usage: baselines=1/);
 
   const status = await client.getStatus(repo);
   assert.equal(status.enabled, true);
+  assert.equal(status.runtimeLoaded, true);
   assert.equal(["initializing", "indexing", "ready"].includes(status.state), true);
+  assert.equal(status.daemonLifecycle.enabledRepoCount, 1);
+  assert.equal(status.daemonLifecycle.loadedRuntimeCount, 1);
   assert.equal(status.repoId, expectedRepoId);
   assert.equal(status.baseline.dbPath, expectedBaselinePath);
   assert.equal(status.overlay.dbPath, expectedOverlayPath);

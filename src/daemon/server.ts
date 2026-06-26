@@ -7,6 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import { promisify } from "node:util";
 
 import { RepoRuntime } from "./repo-runtime.ts";
+import { RepoRegistry } from "./repo-registry.ts";
 import { SqliteStoreManager, type FileAnalysisRecord, type OmittedFileRecord } from "./sqlite-store.ts";
 import { TsJsAnalyzer } from "./tsjs-analyzer.ts";
 import {
@@ -17,7 +18,6 @@ import {
   SYMBOL_LOOKUP_MATCH_LIMIT,
   asUnixTransport,
   buildRuntimePaths,
-  createRepoId,
   createRepoRuntimeKey,
   type AnalysisQuality,
   type DaemonErrorResponse,
@@ -172,6 +172,7 @@ class SocketDaemonServer implements DaemonServer {
   private readonly startedAt = new Date().toISOString();
   private readonly runtimePaths: ReturnType<typeof buildRuntimePaths>;
   private readonly storeManager: SqliteStoreManager;
+  private readonly registry: RepoRegistry;
   private readonly analyzer = new TsJsAnalyzer();
   private readonly runtimes = new Map<string, RepoRuntime>();
   private readonly jobs = new Map<string, IndexJobState>();
@@ -191,6 +192,9 @@ class SocketDaemonServer implements DaemonServer {
       cacheDir: this.runtimePaths.cacheDir,
       indexerVersion: this.version,
     });
+    this.registry = new RepoRegistry({
+      cacheDir: this.runtimePaths.cacheDir,
+    });
     this.indexingDebounceMs = options.indexingDebounceMs ?? 50;
   }
 
@@ -200,6 +204,7 @@ class SocketDaemonServer implements DaemonServer {
     }
 
     await this.ensureRuntimeDirectories();
+    await this.registry.initialize();
 
     const server = createServer((socket) => {
       void this.handleSocket(socket);
@@ -299,6 +304,8 @@ class SocketDaemonServer implements DaemonServer {
   async enableRepoIndexing(locator: RepoLocator): Promise<RepoStatus> {
     const runtime = await this.ensureRuntime(locator);
     runtime.enable();
+    await this.registry.markEnabled(locator, runtime.repoId);
+    await this.syncRegistryFromRuntime(locator, runtime);
     this.scheduleIndex(runtime, locator, "enable");
     return runtime.toStatus(this.health(), asUnixTransport(this.options.socketPath));
   }
@@ -313,6 +320,8 @@ class SocketDaemonServer implements DaemonServer {
       job.queued = false;
       job.active = false;
     }
+    await this.registry.markDisabled(locator, runtime.repoId);
+    await this.syncRegistryFromRuntime(locator, runtime);
     await this.refreshRuntimeProjection(runtime, locator);
     return runtime.toStatus(this.health(), asUnixTransport(this.options.socketPath));
   }
@@ -588,6 +597,7 @@ class SocketDaemonServer implements DaemonServer {
       const refreshedRuntime = await this.ensureRuntime(locator);
       const dirtySnapshot = await this.computeDirtySnapshot(locator);
       refreshedRuntime.markIndexing(dirtySnapshot.files.length);
+      await this.syncRegistryFromRuntime(locator, refreshedRuntime);
 
       const baselineDiscovery = await this.discoverBaselineFiles(locator);
       const overlayDiscovery = await this.discoverOverlayFiles(locator);
@@ -633,10 +643,12 @@ class SocketDaemonServer implements DaemonServer {
         pendingFiles: 0,
         indexedAt,
       });
+      await this.syncRegistryFromRuntime(locator, refreshedRuntime);
 
       await this.refreshRuntimeProjection(refreshedRuntime, locator);
     } catch (error) {
       runtime.markError(error instanceof Error ? error.message : String(error));
+      await this.syncRegistryFromRuntime(locator, runtime);
     } finally {
       job.active = false;
       const rerun = job.queued;
@@ -674,6 +686,7 @@ class SocketDaemonServer implements DaemonServer {
       if (currentRuntime.enabled) {
         currentRuntime.markError(error instanceof Error ? error.message : String(error));
       }
+      await this.syncRegistryFromRuntime(locator, currentRuntime);
       return;
     }
 
@@ -690,16 +703,19 @@ class SocketDaemonServer implements DaemonServer {
     const job = this.jobs.get(currentRuntime.key);
     if (!currentRuntime.enabled) {
       currentRuntime.state = "disabled";
+      await this.syncRegistryFromRuntime(locator, currentRuntime);
       return;
     }
 
     if (job?.active || job?.queued) {
       currentRuntime.markIndexing(currentDirty.files.length);
+      await this.syncRegistryFromRuntime(locator, currentRuntime);
       return;
     }
 
     if (currentRuntime.lastError) {
       currentRuntime.state = "error";
+      await this.syncRegistryFromRuntime(locator, currentRuntime);
       return;
     }
 
@@ -707,22 +723,26 @@ class SocketDaemonServer implements DaemonServer {
     if (currentRuntime.lastSuccessfulIndexAt && snapshotMatches) {
       currentRuntime.state = "ready";
       currentRuntime.filesPending = 0;
+      await this.syncRegistryFromRuntime(locator, currentRuntime);
       return;
     }
 
     if (currentRuntime.lastSuccessfulIndexAt && currentDirty.files.length > 0 && currentDirty.oldestAgeMs >= STALE_SETTLE_MS) {
       currentRuntime.markStale(currentDirty.files.length);
+      await this.syncRegistryFromRuntime(locator, currentRuntime);
       return;
     }
 
     if (!currentRuntime.lastSuccessfulIndexAt) {
       currentRuntime.state = "initializing";
       currentRuntime.filesPending = currentDirty.files.length;
+      await this.syncRegistryFromRuntime(locator, currentRuntime);
       return;
     }
 
     currentRuntime.state = "ready";
     currentRuntime.filesPending = currentDirty.files.length;
+    await this.syncRegistryFromRuntime(locator, currentRuntime);
   }
 
   private async analyzeFile(repoRelativePath: string, content: string): Promise<FileAnalysisRecord> {
@@ -1073,30 +1093,50 @@ class SocketDaemonServer implements DaemonServer {
     };
   }
 
+  private async syncRegistryFromRuntime(locator: RepoLocator, runtime: RepoRuntime): Promise<void> {
+    await this.registry.upsertFromLocator(locator);
+    this.registry.updateLifecycle({
+      worktreeId: runtime.worktreeId,
+      repoId: runtime.repoId,
+      headCommit: runtime.headCommit,
+      enabled: runtime.enabled,
+      state: runtime.enabled ? runtime.state : "disabled",
+      lastSuccessfulIndexAt: runtime.lastSuccessfulIndexAt,
+      lastError: runtime.lastError,
+    });
+  }
+
   private async ensureRuntime(locator: RepoLocator): Promise<RepoRuntime> {
-    const repoId = createRepoId(locator.repoRoot);
+    const persisted = await this.registry.upsertFromLocator(locator);
     const runtimeKey = createRepoRuntimeKey(locator);
     const anchors = await this.storeManager.ensureRepoStores(locator);
     const existing = this.runtimes.get(runtimeKey);
 
     if (existing) {
       existing.refresh(locator, anchors);
+      existing.enabled = persisted.enabled;
+      existing.restoreState(persisted.enabled ? persisted.state : "disabled", {
+        lastSuccessfulIndexAt: persisted.lastSuccessfulIndexAt,
+        lastError: persisted.lastError,
+      });
       return existing;
     }
 
     const runtime = new RepoRuntime({
-      repoId,
+      repoId: persisted.repoId,
       repoName: locator.repoName,
       repoRoot: locator.repoRoot,
       gitDir: locator.gitDir,
       worktreeId: locator.worktreeId,
       headCommit: locator.headCommit,
-      enabled: false,
-      state: "disabled",
+      enabled: persisted.enabled,
+      state: persisted.enabled ? persisted.state : "disabled",
       baseline: anchors.baseline,
       overlay: anchors.overlay,
-      createdAt: new Date().toISOString(),
-      lastUpdated: new Date().toISOString(),
+      createdAt: persisted.createdAt,
+      lastUpdated: persisted.lastUpdated,
+      lastSuccessfulIndexAt: persisted.lastSuccessfulIndexAt,
+      lastError: persisted.lastError,
     });
 
     this.runtimes.set(runtime.key, runtime);

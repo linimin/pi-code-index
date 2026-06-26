@@ -52,6 +52,7 @@ export interface RuntimePaths {
   socketPath: string;
   reposDir: string;
   pidFile: string;
+  registryDbPath: string;
 }
 
 export interface RepoLocator {
@@ -314,6 +315,7 @@ export function buildRuntimePaths(options: { cacheDir?: string; socketPath?: str
     socketPath,
     reposDir: join(cacheDir, "repos"),
     pidFile: join(cacheDir, "daemon.pid"),
+    registryDbPath: join(cacheDir, "repo-registry.sqlite"),
   };
 }
 

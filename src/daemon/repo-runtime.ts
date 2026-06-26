@@ -27,6 +27,7 @@ export interface RepoRuntimeDescriptor {
   lastUpdated: string;
   lastSuccessfulIndexAt?: string;
   lastError?: string;
+  filesPending?: number;
 }
 
 export interface RepoDiagnosticsOptions {
@@ -83,7 +84,7 @@ export class RepoRuntime {
     this.lastSuccessfulIndexAt = descriptor.lastSuccessfulIndexAt;
     this.lastError = descriptor.lastError;
     this.coverage = { ...EMPTY_COVERAGE };
-    this.filesPending = 0;
+    this.filesPending = descriptor.filesPending ?? 0;
   }
 
   get key(): string {
@@ -118,7 +119,7 @@ export class RepoRuntime {
 
   enable(): void {
     this.enabled = true;
-    this.state = "initializing";
+    this.state = this.lastSuccessfulIndexAt ? this.state : "initializing";
     this.filesPending = 0;
     this.lastError = undefined;
     this.lastUpdated = new Date().toISOString();
@@ -200,6 +201,14 @@ export class RepoRuntime {
     this.coverage = buildCoverage(input.eligibleFiles, input.indexedFiles, input.omittedFiles);
     this.filesPending = input.pendingFiles;
     this.lastSuccessfulIndexAt = input.lastIndexedAt ?? this.lastSuccessfulIndexAt;
+  }
+
+  restoreState(state: RepoIndexingState, options: { lastSuccessfulIndexAt?: string; lastError?: string; filesPending?: number } = {}): void {
+    this.state = state;
+    this.lastSuccessfulIndexAt = options.lastSuccessfulIndexAt ?? this.lastSuccessfulIndexAt;
+    this.lastError = options.lastError;
+    this.filesPending = options.filesPending ?? this.filesPending;
+    this.lastUpdated = new Date().toISOString();
   }
 
   toOpenRepoResponse(): OpenRepoResponse {

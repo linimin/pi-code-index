@@ -8,7 +8,7 @@ import test from "node:test";
 
 import { createDaemonServer } from "../src/daemon/server.ts";
 import { resolveRepoLocator } from "../src/extension/daemon-client.ts";
-import type { RepoIndexingState, RepoLocator } from "../src/shared/protocol.ts";
+import { buildRuntimePaths, type RepoIndexingState, type RepoLocator } from "../src/shared/protocol.ts";
 
 test("indexing pipeline persists structural and fallback analysis with truthful readiness, stale, reindex, and disable transitions", async (t) => {
   const tempRoot = await mkdtemp(join(tmpdir(), "pi-code-index-storage-"));
@@ -83,6 +83,54 @@ test("indexing pipeline persists structural and fallback analysis with truthful 
   assert.equal(status.state, "disabled");
   assert.equal(await pathExists(status.baseline.dbPath), true);
   assert.equal(await pathExists(status.overlay.dbPath), true);
+});
+
+test("registry persists enabled repo lifecycle across daemon restart", async (t) => {
+  const tempRoot = await mkdtemp(join(tmpdir(), "pi-code-index-registry-"));
+  const repoDir = join(tempRoot, "repo");
+  const cacheDir = join(tempRoot, "cache");
+  const socketPath = join(cacheDir, "daemon.sock");
+  const firstServer = await createDaemonServer({ socketPath, cacheDir, indexingDebounceMs: 80 });
+
+  await firstServer.start();
+  await seedIndexedRepo(repoDir);
+  const repo = await resolveRepoLocator(repoDir);
+
+  await firstServer.enableRepoIndexing(repo);
+  const readyStatus = await waitForState(firstServer, repo, ["ready"], 5_000);
+  await firstServer.stop();
+
+  const secondServer = await createDaemonServer({ socketPath, cacheDir, indexingDebounceMs: 80 });
+  await secondServer.start();
+
+  t.after(async () => {
+    await secondServer.stop();
+    await rm(tempRoot, { recursive: true, force: true });
+  });
+
+  const restoredOpen = await secondServer.openRepo(repo);
+  const restoredStatus = await secondServer.getStatus(repo);
+  const runtimePaths = buildRuntimePaths({ cacheDir, socketPath });
+  const registryRow = readRegistryRow(runtimePaths.registryDbPath, repo.worktreeId);
+
+  assert.equal(restoredOpen.enabled, true);
+  assert.equal(restoredStatus.enabled, true);
+  assert.notEqual(restoredStatus.state, "disabled");
+  assert.equal(restoredStatus.repoId, readyStatus.repoId);
+  assert.equal(restoredStatus.baseline.dbPath, readyStatus.baseline.dbPath);
+  assert.equal(restoredStatus.overlay.dbPath, readyStatus.overlay.dbPath);
+  assert.equal(await pathExists(runtimePaths.registryDbPath), true);
+  assert.equal(registryRow?.enabled, 1);
+  assert.equal(registryRow?.repo_id, readyStatus.repoId);
+  assert.equal(registryRow?.worktree_id, repo.worktreeId);
+  assert.match(registryRow?.last_successful_index_at ?? "", /T/);
+
+  const otherRepoDir = join(tempRoot, "other-repo");
+  await setupSimpleRepo(otherRepoDir);
+  const otherRepo = await resolveRepoLocator(otherRepoDir);
+  const otherStatus = await secondServer.getStatus(otherRepo);
+  assert.equal(otherStatus.enabled, false);
+  assert.equal(otherStatus.state, "disabled");
 });
 
 test("failed reindex transitions to error when repo access breaks", async (t) => {
@@ -167,6 +215,14 @@ async function seedIndexedRepo(repoDir: string): Promise<void> {
   await writeFile(join(repoDir, "node_modules", "ignored.js"), "console.log('skip');\n", "utf8");
 }
 
+async function setupSimpleRepo(repoDir: string): Promise<void> {
+  await mkdir(repoDir, { recursive: true });
+  execGitInit(repoDir);
+  await writeFile(join(repoDir, "index.ts"), "export const value = 1;\n", "utf8");
+  execGit(repoDir, ["add", "."]);
+  execGit(repoDir, ["commit", "-m", "initial"]);
+}
+
 function execGitInit(repoDir: string): void {
   execGit(repoDir, ["init"]);
   execGit(repoDir, ["config", "user.email", "test@example.com"]);
@@ -197,6 +253,20 @@ async function waitForState(
   }
 
   throw new Error(`Timed out waiting for states: ${states.join(", ")}`);
+}
+
+function readRegistryRow(dbPath: string, worktreeId: string) {
+  const db = new DatabaseSync(dbPath, { open: true, readOnly: true });
+  try {
+    return db.prepare("SELECT repo_id, worktree_id, enabled, last_successful_index_at FROM repo_registry WHERE worktree_id = ?").get(worktreeId) as {
+      repo_id: string;
+      worktree_id: string;
+      enabled: number;
+      last_successful_index_at: string | null;
+    } | undefined;
+  } finally {
+    db.close();
+  }
 }
 
 function readIndexedFacts(dbPath: string) {

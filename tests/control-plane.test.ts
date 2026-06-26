@@ -117,7 +117,7 @@ test("/index enable -> /index status -> /index doctor uses real daemon state and
 
   const status = await client.getStatus(repo);
   assert.equal(status.enabled, true);
-  assert.equal(status.state, "initializing");
+  assert.equal(["initializing", "indexing", "ready"].includes(status.state), true);
   assert.equal(status.repoId, expectedRepoId);
   assert.equal(status.baseline.dbPath, expectedBaselinePath);
   assert.equal(status.overlay.dbPath, expectedOverlayPath);

@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "mission_anchor": "Fully implement `pi-code-index` across all explicitly documented project phases available in the repository, starting from the normative Phase 1 MVP and continuing through any additional concrete phase specs, while preserving the documented architecture of a thin pi extension backed by a local daemon.",
+  "workflow_entry_status": "active",
+  "workflow_entry_source": "/cook",
+  "workflow_entry_confirmed_at": "2026-06-26T02:48:18.294Z",
+  "workflow_session_id": "wf-mquc058i-bkju9h",
+  "startup_brief_path": ".agent/current/startup-brief.json",
+  "current_phase": "post_commit_review",
+  "continuation_policy": "continue",
+  "continuation_reason": "Slice p1-index-storage-and-analysis is implemented and verified from commit a18d882752cc0f0066181ae2fd4b84e8ca79da0f. Current HEAD carries the same slice diff plus canonical post-commit workflow bookkeeping and is ready for completion-reviewer review.",
+  "project_done": false,
+  "task_type": "completion-workflow",
+  "evaluation_profile": "completion-rubric-v1",
+  "requires_reground": false,
+  "slices_since_last_reground": 2,
+  "remaining_release_blockers": 1,
+  "remaining_high_value_gaps": 0,
+  "unsatisfied_contract_ids": [
+    "P1-TOOLS-DIAGNOSTICS"
+  ],
+  "release_blocker_ids": [
+    "P1-TOOLS-DIAGNOSTICS"
+  ],
+  "next_mandatory_action": "Review committed slice p1-index-storage-and-analysis",
+  "next_mandatory_role": "completion-reviewer",
+  "remaining_stop_judges": 1,
+  "current_stop_wave_id": 0,
+  "last_reground_at": "2026-06-26T03:12:30Z",
+  "last_auditor_verdict": null,
+  "contract_status": "incomplete",
+  "latest_completed_slice": "p1-index-storage-and-analysis@a18d882752cc0f0066181ae2fd4b84e8ca79da0f",
+  "latest_verified_slice": "p1-index-storage-and-analysis@a18d882752cc0f0066181ae2fd4b84e8ca79da0f"
+}

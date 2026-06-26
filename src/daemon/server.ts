@@ -1,10 +1,13 @@
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createServer, createConnection, type Server, type Socket } from "node:net";
-import { dirname } from "node:path";
+import { dirname, join, relative } from "node:path";
+import { promisify } from "node:util";
 
 import { RepoRuntime } from "./repo-runtime.ts";
-import { SqliteStoreManager } from "./sqlite-store.ts";
+import { SqliteStoreManager, type FileAnalysisRecord, type OmittedFileRecord } from "./sqlite-store.ts";
+import { TsJsAnalyzer } from "./tsjs-analyzer.ts";
 import {
   DAEMON_PROTOCOL_VERSION,
   asUnixTransport,
@@ -23,10 +26,16 @@ import {
   type RepoStatus,
 } from "../shared/protocol.ts";
 
+const execFileAsync = promisify(execFile);
+const DEFAULT_EXCLUDED_DIRS = new Set([".git", "node_modules", "dist", "build", ".next", "coverage", "vendor", "target", ".venv"]);
+const MAX_FILE_BYTES = 2 * 1024 * 1024;
+const STALE_SETTLE_MS = 2_000;
+
 export interface DaemonServerOptions {
   cacheDir?: string;
   socketPath: string;
   version?: string;
+  indexingDebounceMs?: number;
 }
 
 export interface DaemonServer {
@@ -74,14 +83,44 @@ class RequestError extends Error {
   }
 }
 
+interface IndexJobState {
+  active: boolean;
+  queued: boolean;
+  timer?: NodeJS.Timeout;
+}
+
+interface DirtySnapshot {
+  files: string[];
+  signature: string;
+  oldestAgeMs: number;
+}
+
+interface BaselineCandidate {
+  repoRelativePath: string;
+  content: string;
+}
+
+interface OverlayCandidate {
+  repoRelativePath: string;
+  content: string;
+}
+
+interface DiscoveryResult<TFile> {
+  files: TFile[];
+  omitted: OmittedFileRecord[];
+}
+
 class SocketDaemonServer implements DaemonServer {
   private readonly instanceId = randomUUID();
   private readonly version: string;
   private readonly startedAt = new Date().toISOString();
   private readonly runtimePaths: ReturnType<typeof buildRuntimePaths>;
   private readonly storeManager: SqliteStoreManager;
+  private readonly analyzer = new TsJsAnalyzer();
   private readonly runtimes = new Map<string, RepoRuntime>();
+  private readonly jobs = new Map<string, IndexJobState>();
   private readonly options: DaemonServerOptions;
+  private readonly indexingDebounceMs: number;
   private server?: Server;
   private started = false;
 
@@ -96,6 +135,7 @@ class SocketDaemonServer implements DaemonServer {
       cacheDir: this.runtimePaths.cacheDir,
       indexerVersion: this.version,
     });
+    this.indexingDebounceMs = options.indexingDebounceMs ?? 50;
   }
 
   async start(): Promise<void> {
@@ -141,6 +181,13 @@ class SocketDaemonServer implements DaemonServer {
   }
 
   async stop(): Promise<void> {
+    for (const job of this.jobs.values()) {
+      if (job.timer) {
+        clearTimeout(job.timer);
+      }
+    }
+    this.jobs.clear();
+
     if (!this.server) {
       await this.cleanupSocketArtifacts();
       this.started = false;
@@ -186,41 +233,361 @@ class SocketDaemonServer implements DaemonServer {
 
   async openRepo(locator: RepoLocator): Promise<OpenRepoResponse> {
     const runtime = await this.ensureRuntime(locator);
+    await this.refreshRuntimeProjection(runtime, locator);
     return runtime.toOpenRepoResponse();
   }
 
   async enableRepoIndexing(locator: RepoLocator): Promise<RepoStatus> {
     const runtime = await this.ensureRuntime(locator);
     runtime.enable();
+    this.scheduleIndex(runtime, locator, "enable");
     return runtime.toStatus(this.health(), asUnixTransport(this.options.socketPath));
   }
 
   async disableRepoIndexing(locator: RepoLocator): Promise<RepoStatus> {
     const runtime = await this.ensureRuntime(locator);
     runtime.disable();
+    const job = this.jobs.get(runtime.key);
+    if (job?.timer) {
+      clearTimeout(job.timer);
+      job.timer = undefined;
+      job.queued = false;
+      job.active = false;
+    }
+    await this.refreshRuntimeProjection(runtime, locator);
     return runtime.toStatus(this.health(), asUnixTransport(this.options.socketPath));
   }
 
   async getStatus(locator: RepoLocator): Promise<RepoStatus> {
     const runtime = await this.ensureRuntime(locator);
+    await this.refreshRuntimeProjection(runtime, locator);
     return runtime.toStatus(this.health(), asUnixTransport(this.options.socketPath));
   }
 
   async getRepoDiagnostics(locator: RepoLocator): Promise<RepoDiagnostics> {
     const runtime = await this.ensureRuntime(locator);
+    await this.refreshRuntimeProjection(runtime, locator);
     const storageSummary = await this.storeManager.getStorageSummary(runtime.repoId, runtime.overlay);
+    const job = this.jobs.get(runtime.key);
 
     return runtime.toDiagnostics({
       health: this.health(),
       transport: asUnixTransport(this.options.socketPath),
       storageSummary,
+      queueDepth: job?.active || job?.queued ? 1 : 0,
+      activeJobs: job?.active ? ["index-rebuild"] : [],
     });
   }
 
   async reindexRepo(locator: RepoLocator): Promise<RepoStatus> {
     const runtime = await this.ensureRuntime(locator);
     runtime.reindex();
+    this.scheduleIndex(runtime, locator, "reindex");
     return runtime.toStatus(this.health(), asUnixTransport(this.options.socketPath));
+  }
+
+  private scheduleIndex(runtime: RepoRuntime, locator: RepoLocator, trigger: "enable" | "reindex"): void {
+    const job = this.jobs.get(runtime.key) ?? { active: false, queued: false };
+    if (job.active) {
+      job.queued = true;
+      this.jobs.set(runtime.key, job);
+      return;
+    }
+
+    if (job.timer) {
+      clearTimeout(job.timer);
+    }
+
+    job.queued = true;
+    job.timer = setTimeout(() => {
+      job.timer = undefined;
+      void this.runIndexJob(runtime, locator, trigger);
+    }, this.indexingDebounceMs);
+    this.jobs.set(runtime.key, job);
+  }
+
+  private async runIndexJob(runtime: RepoRuntime, locator: RepoLocator, trigger: "enable" | "reindex"): Promise<void> {
+    const job = this.jobs.get(runtime.key) ?? { active: false, queued: false };
+    if (!runtime.enabled) {
+      job.active = false;
+      job.queued = false;
+      this.jobs.set(runtime.key, job);
+      return;
+    }
+
+    job.active = true;
+    job.queued = false;
+    this.jobs.set(runtime.key, job);
+
+    try {
+      const refreshedRuntime = await this.ensureRuntime(locator);
+      const dirtySnapshot = await this.computeDirtySnapshot(locator);
+      refreshedRuntime.markIndexing(dirtySnapshot.files.length);
+
+      const baselineDiscovery = await this.discoverBaselineFiles(locator);
+      const overlayDiscovery = await this.discoverOverlayFiles(locator);
+      const [baselineRecords, overlayRecords] = await Promise.all([
+        Promise.all(baselineDiscovery.files.map((file) => this.analyzeFile(file.repoRelativePath, file.content))),
+        Promise.all(overlayDiscovery.files.map((file) => this.analyzeFile(file.repoRelativePath, file.content))),
+      ]);
+
+      const indexedAt = new Date().toISOString();
+      const baseline = await this.storeManager.replaceBaselineIndex({
+        anchor: refreshedRuntime.baseline,
+        repoId: refreshedRuntime.repoId,
+        headCommit: locator.headCommit,
+        worktreeId: locator.worktreeId,
+        indexedFiles: baselineRecords,
+        omittedFiles: baselineDiscovery.omitted,
+        pendingFiles: [],
+        indexedAt,
+        dirtySignature: "baseline",
+      });
+      const overlay = await this.storeManager.replaceOverlayIndex({
+        anchor: refreshedRuntime.overlay,
+        repoId: refreshedRuntime.repoId,
+        headCommit: locator.headCommit,
+        worktreeId: locator.worktreeId,
+        indexedFiles: overlayRecords,
+        omittedFiles: overlayDiscovery.omitted,
+        pendingFiles: dirtySnapshot.files,
+        indexedAt,
+        dirtySignature: dirtySnapshot.signature,
+      });
+
+      refreshedRuntime.markReady({
+        baseline,
+        overlay,
+        indexedFiles: baselineRecords.length + overlayRecords.length,
+        eligibleFiles:
+          baselineRecords.length +
+          overlayRecords.length +
+          baselineDiscovery.omitted.length +
+          overlayDiscovery.omitted.length,
+        omittedFiles: baselineDiscovery.omitted.length + overlayDiscovery.omitted.length,
+        pendingFiles: 0,
+        indexedAt,
+      });
+
+      await this.refreshRuntimeProjection(refreshedRuntime, locator);
+    } catch (error) {
+      runtime.markError(error instanceof Error ? error.message : String(error));
+    } finally {
+      job.active = false;
+      const rerun = job.queued;
+      job.queued = false;
+      this.jobs.set(runtime.key, job);
+      if (rerun && runtime.enabled) {
+        this.scheduleIndex(runtime, locator, trigger);
+      }
+    }
+  }
+
+  private async refreshRuntimeProjection(runtime: RepoRuntime, locator: RepoLocator): Promise<void> {
+    const currentRuntime = await this.ensureRuntime(locator);
+    const [baselineSnapshot, overlaySnapshot] = await Promise.all([
+      this.storeManager.readSnapshot(currentRuntime.baseline),
+      this.storeManager.readSnapshot(currentRuntime.overlay),
+    ]);
+    const baselineIndexed = baselineSnapshot.indexedFiles;
+    const overlayIndexed = overlaySnapshot.indexedFiles;
+    const eligibleFiles = baselineIndexed + overlayIndexed + baselineSnapshot.omittedFiles + overlaySnapshot.omittedFiles;
+
+    let currentDirty: DirtySnapshot;
+    try {
+      currentDirty = await this.computeDirtySnapshot(locator);
+    } catch (error) {
+      currentRuntime.syncCoverage({
+        baseline: currentRuntime.baseline,
+        overlay: currentRuntime.overlay,
+        indexedFiles: baselineIndexed + overlayIndexed,
+        eligibleFiles,
+        omittedFiles: baselineSnapshot.omittedFiles + overlaySnapshot.omittedFiles,
+        pendingFiles: 0,
+        lastIndexedAt: overlaySnapshot.lastIndexedAt ?? baselineSnapshot.lastIndexedAt,
+      });
+      if (currentRuntime.enabled) {
+        currentRuntime.markError(error instanceof Error ? error.message : String(error));
+      }
+      return;
+    }
+
+    currentRuntime.syncCoverage({
+      baseline: currentRuntime.baseline,
+      overlay: currentRuntime.overlay,
+      indexedFiles: baselineIndexed + overlayIndexed,
+      eligibleFiles,
+      omittedFiles: baselineSnapshot.omittedFiles + overlaySnapshot.omittedFiles,
+      pendingFiles: currentDirty.files.length,
+      lastIndexedAt: overlaySnapshot.lastIndexedAt ?? baselineSnapshot.lastIndexedAt,
+    });
+
+    const job = this.jobs.get(currentRuntime.key);
+    if (!currentRuntime.enabled) {
+      currentRuntime.state = "disabled";
+      return;
+    }
+
+    if (job?.active || job?.queued) {
+      currentRuntime.markIndexing(currentDirty.files.length);
+      return;
+    }
+
+    if (currentRuntime.lastError) {
+      currentRuntime.state = "error";
+      return;
+    }
+
+    const snapshotMatches = currentDirty.signature === (overlaySnapshot.dirtySignature ?? "");
+    if (currentRuntime.lastSuccessfulIndexAt && snapshotMatches) {
+      currentRuntime.state = "ready";
+      currentRuntime.filesPending = 0;
+      return;
+    }
+
+    if (currentRuntime.lastSuccessfulIndexAt && currentDirty.files.length > 0 && currentDirty.oldestAgeMs >= STALE_SETTLE_MS) {
+      currentRuntime.markStale(currentDirty.files.length);
+      return;
+    }
+
+    if (!currentRuntime.lastSuccessfulIndexAt) {
+      currentRuntime.state = "initializing";
+      currentRuntime.filesPending = currentDirty.files.length;
+      return;
+    }
+
+    currentRuntime.state = "ready";
+    currentRuntime.filesPending = currentDirty.files.length;
+  }
+
+  private async analyzeFile(repoRelativePath: string, content: string): Promise<FileAnalysisRecord> {
+    if (isPrimaryTsJsFile(repoRelativePath)) {
+      const analysis = await this.analyzer.analyze({
+        path: repoRelativePath,
+        content,
+      });
+      return this.storeManager.createStructuralRecord(repoRelativePath, content, analysis);
+    }
+
+    return this.storeManager.createFallbackRecord(repoRelativePath, content);
+  }
+
+  private async discoverBaselineFiles(locator: RepoLocator): Promise<DiscoveryResult<BaselineCandidate>> {
+    if (!locator.headCommit) {
+      return { files: [], omitted: [] };
+    }
+
+    const trackedOutput = await runGit(locator.repoRoot, ["ls-tree", "-rz", "--full-tree", locator.headCommit]);
+    const files: BaselineCandidate[] = [];
+    const omitted: OmittedFileRecord[] = [];
+
+    for (const entry of trackedOutput.split("\0")) {
+      if (!entry) {
+        continue;
+      }
+
+      const match = entry.match(/^(\d+)\s+(\w+)\s+([0-9a-f]+)\t(.+)$/s);
+      if (!match) {
+        continue;
+      }
+
+      const [, mode, type, , repoRelativePath] = match;
+      if (type !== "blob" || mode === "120000") {
+        omitted.push({ repoRelativePath, reason: mode === "120000" ? "symlink" : "special-file" });
+        continue;
+      }
+
+      const blob = await runGit(locator.repoRoot, ["show", `${locator.headCommit}:${repoRelativePath}`], {
+        encoding: "buffer",
+        maxBuffer: MAX_FILE_BYTES + 64 * 1024,
+      });
+      const decision = evaluateBuffer(repoRelativePath, blob);
+      if (decision.reason) {
+        omitted.push({ repoRelativePath, reason: decision.reason });
+        continue;
+      }
+
+      files.push({
+        repoRelativePath,
+        content: blob.toString("utf8"),
+      });
+    }
+
+    return { files, omitted };
+  }
+
+  private async discoverOverlayFiles(locator: RepoLocator): Promise<DiscoveryResult<OverlayCandidate>> {
+    const modified = await runGit(locator.repoRoot, ["ls-files", "-m", "-z"]);
+    const untracked = await runGit(locator.repoRoot, ["ls-files", "--others", "--exclude-standard", "-z"]);
+    const unique = new Set([...splitNullSeparated(modified), ...splitNullSeparated(untracked)]);
+    const files: OverlayCandidate[] = [];
+    const omitted: OmittedFileRecord[] = [];
+
+    for (const repoRelativePath of [...unique].sort()) {
+      const absolutePath = join(locator.repoRoot, repoRelativePath);
+      const safePath = normalizeRepoRelative(locator.repoRoot, absolutePath);
+      if (!safePath) {
+        omitted.push({ repoRelativePath, reason: "outside-repo-root" });
+        continue;
+      }
+
+      const entry = await lstat(absolutePath).catch(() => null);
+      if (!entry) {
+        continue;
+      }
+
+      if (entry.isSymbolicLink()) {
+        omitted.push({ repoRelativePath, reason: "symlink" });
+        continue;
+      }
+
+      if (!entry.isFile()) {
+        omitted.push({ repoRelativePath, reason: "special-file" });
+        continue;
+      }
+
+      const buffer = await readFile(absolutePath);
+      const decision = evaluateBuffer(safePath, buffer);
+      if (decision.reason) {
+        omitted.push({ repoRelativePath: safePath, reason: decision.reason });
+        continue;
+      }
+
+      files.push({
+        repoRelativePath: safePath,
+        content: buffer.toString("utf8"),
+      });
+    }
+
+    return { files, omitted };
+  }
+
+  private async computeDirtySnapshot(locator: RepoLocator): Promise<DirtySnapshot> {
+    const modified = await runGit(locator.repoRoot, ["ls-files", "-m", "-z"]);
+    const untracked = await runGit(locator.repoRoot, ["ls-files", "--others", "--exclude-standard", "-z"]);
+    const files = [...new Set([...splitNullSeparated(modified), ...splitNullSeparated(untracked)])].sort();
+
+    let oldestAgeMs = 0;
+    const signatureParts: string[] = [];
+    for (const repoRelativePath of files) {
+      const entry = await stat(join(locator.repoRoot, repoRelativePath)).catch(() => null);
+      if (!entry) {
+        signatureParts.push(`${repoRelativePath}:missing`);
+        continue;
+      }
+
+      const age = Date.now() - entry.mtimeMs;
+      if (age > oldestAgeMs) {
+        oldestAgeMs = age;
+      }
+      signatureParts.push(`${repoRelativePath}:${entry.size}:${Math.floor(entry.mtimeMs)}`);
+    }
+
+    return {
+      files,
+      signature: signatureParts.join("\n"),
+      oldestAgeMs,
+    };
   }
 
   private async handleSocket(socket: Socket): Promise<void> {
@@ -464,4 +831,82 @@ async function canConnect(socketPath: string): Promise<boolean> {
 
 export async function createDaemonServer(options: DaemonServerOptions): Promise<DaemonServer> {
   return new SocketDaemonServer(options);
+}
+
+function isPrimaryTsJsFile(path: string): boolean {
+  return /\.(cts|cjs|js|jsx|mjs|mts|ts|tsx)$/i.test(path);
+}
+
+function splitNullSeparated(output: string): string[] {
+  return output.split("\0").filter((value) => value.length > 0);
+}
+
+function normalizeRepoRelative(repoRoot: string, absolutePath: string): string | null {
+  const rel = relative(repoRoot, absolutePath);
+  if (rel.startsWith("..") || rel.includes(`..${process.platform === "win32" ? "\\" : "/"}`)) {
+    return null;
+  }
+
+  return rel.replace(/\\/g, "/");
+}
+
+function evaluateBuffer(repoRelativePath: string, buffer: Buffer): { reason?: string } {
+  if (isDefaultExcluded(repoRelativePath)) {
+    return { reason: "default-excluded" };
+  }
+
+  if (isSensitivePath(repoRelativePath)) {
+    return { reason: "sensitive-file" };
+  }
+
+  if (buffer.byteLength > MAX_FILE_BYTES) {
+    return { reason: "too-large" };
+  }
+
+  if (isBinaryBuffer(buffer)) {
+    return { reason: "binary" };
+  }
+
+  return {};
+}
+
+function isDefaultExcluded(repoRelativePath: string): boolean {
+  const parts = repoRelativePath.split("/");
+  return parts.some((part) => DEFAULT_EXCLUDED_DIRS.has(part));
+}
+
+function isSensitivePath(repoRelativePath: string): boolean {
+  const base = repoRelativePath.split("/").at(-1)?.toLowerCase() ?? repoRelativePath.toLowerCase();
+  return (
+    base === ".env" ||
+    base.startsWith(".env.") ||
+    base === ".npmrc" ||
+    base === ".pypirc" ||
+    base === "id_rsa" ||
+    base === "id_ed25519" ||
+    /\.(pem|key|p12|pfx)$/i.test(base)
+  );
+}
+
+function isBinaryBuffer(buffer: Buffer): boolean {
+  const sample = buffer.subarray(0, Math.min(buffer.length, 8192));
+  if (sample.includes(0)) {
+    return true;
+  }
+
+  const decoded = sample.toString("utf8");
+  return decoded.includes("\ufffd");
+}
+
+async function runGit(
+  cwd: string,
+  args: string[],
+  options: { encoding?: "utf8" | "buffer"; maxBuffer?: number } = {},
+): Promise<string | Buffer> {
+  const result = await execFileAsync("git", args, {
+    cwd,
+    encoding: options.encoding ?? "utf8",
+    maxBuffer: options.maxBuffer ?? 8 * 1024 * 1024,
+  });
+  return result.stdout;
 }

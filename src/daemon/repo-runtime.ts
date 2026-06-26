@@ -1,6 +1,7 @@
 import {
   DEFAULT_ANALYZER_CAPABILITIES,
   createRepoRuntimeKey,
+  type CoverageMetadata,
   type HealthResponse,
   type OpenRepoResponse,
   type RepoDiagnostics,
@@ -36,12 +37,15 @@ export interface RepoDiagnosticsOptions {
     overlayBytes: number;
     totalBytes: number;
   };
+  queueDepth: number;
+  activeJobs: string[];
 }
 
-const EMPTY_COVERAGE = {
+const EMPTY_COVERAGE: CoverageMetadata = {
   eligibleFiles: 0,
   indexedFiles: 0,
   indexedPercent: 0,
+  omittedFiles: 0,
 };
 
 export class RepoRuntime {
@@ -60,6 +64,8 @@ export class RepoRuntime {
   lastUpdated: string;
   lastSuccessfulIndexAt?: string;
   lastError?: string;
+  coverage: CoverageMetadata;
+  filesPending: number;
 
   constructor(descriptor: RepoRuntimeDescriptor) {
     this.repoId = descriptor.repoId;
@@ -76,6 +82,8 @@ export class RepoRuntime {
     this.lastUpdated = descriptor.lastUpdated;
     this.lastSuccessfulIndexAt = descriptor.lastSuccessfulIndexAt;
     this.lastError = descriptor.lastError;
+    this.coverage = { ...EMPTY_COVERAGE };
+    this.filesPending = 0;
   }
 
   get key(): string {
@@ -102,12 +110,16 @@ export class RepoRuntime {
 
     if (changed) {
       this.lastUpdated = new Date().toISOString();
+      if (this.enabled && this.state === "ready") {
+        this.state = "stale";
+      }
     }
   }
 
   enable(): void {
     this.enabled = true;
     this.state = "initializing";
+    this.filesPending = 0;
     this.lastError = undefined;
     this.lastUpdated = new Date().toISOString();
   }
@@ -115,6 +127,7 @@ export class RepoRuntime {
   disable(): void {
     this.enabled = false;
     this.state = "disabled";
+    this.filesPending = 0;
     this.lastUpdated = new Date().toISOString();
   }
 
@@ -126,6 +139,67 @@ export class RepoRuntime {
     this.state = "indexing";
     this.lastError = undefined;
     this.lastUpdated = new Date().toISOString();
+  }
+
+  markIndexing(pendingFiles: number): void {
+    if (!this.enabled) {
+      return;
+    }
+
+    this.state = this.lastSuccessfulIndexAt ? "indexing" : "initializing";
+    this.filesPending = pendingFiles;
+    this.lastUpdated = new Date().toISOString();
+  }
+
+  markReady(input: {
+    baseline: StoreAnchor;
+    overlay: StoreAnchor;
+    indexedFiles: number;
+    eligibleFiles: number;
+    omittedFiles: number;
+    pendingFiles: number;
+    indexedAt: string;
+  }): void {
+    this.baseline = input.baseline;
+    this.overlay = input.overlay;
+    this.coverage = buildCoverage(input.eligibleFiles, input.indexedFiles, input.omittedFiles);
+    this.filesPending = input.pendingFiles;
+    this.lastSuccessfulIndexAt = input.indexedAt;
+    this.lastError = undefined;
+    this.state = input.pendingFiles > 0 ? "stale" : "ready";
+    this.lastUpdated = new Date().toISOString();
+  }
+
+  markStale(pendingFiles: number): void {
+    if (!this.enabled || this.state === "disabled") {
+      return;
+    }
+
+    this.state = "stale";
+    this.filesPending = pendingFiles;
+    this.lastUpdated = new Date().toISOString();
+  }
+
+  markError(message: string): void {
+    this.state = "error";
+    this.lastError = message;
+    this.lastUpdated = new Date().toISOString();
+  }
+
+  syncCoverage(input: {
+    baseline: StoreAnchor;
+    overlay: StoreAnchor;
+    indexedFiles: number;
+    eligibleFiles: number;
+    omittedFiles: number;
+    pendingFiles: number;
+    lastIndexedAt?: string;
+  }): void {
+    this.baseline = input.baseline;
+    this.overlay = input.overlay;
+    this.coverage = buildCoverage(input.eligibleFiles, input.indexedFiles, input.omittedFiles);
+    this.filesPending = input.pendingFiles;
+    this.lastSuccessfulIndexAt = input.lastIndexedAt ?? this.lastSuccessfulIndexAt;
   }
 
   toOpenRepoResponse(): OpenRepoResponse {
@@ -155,9 +229,9 @@ export class RepoRuntime {
       protocolVersion: health.protocolVersion,
       daemonVersion: health.daemonVersion,
       headCommit: this.headCommit,
-      indexedFiles: 0,
-      filesPending: 0,
-      coverage: EMPTY_COVERAGE,
+      indexedFiles: this.coverage.indexedFiles,
+      filesPending: this.filesPending,
+      coverage: this.coverage,
       lastUpdated: this.lastUpdated,
       lastError: this.lastError,
       baseline: this.baseline,
@@ -182,8 +256,8 @@ export class RepoRuntime {
         worktreeId: this.worktreeId,
       },
       analyzerCapabilities: { ...DEFAULT_ANALYZER_CAPABILITIES },
-      queueDepth: 0,
-      activeJobs: [],
+      queueDepth: options.queueDepth,
+      activeJobs: options.activeJobs,
       storageSummary: options.storageSummary,
       lastSuccessfulIndexAt: this.lastSuccessfulIndexAt,
       actionableErrors: this.lastError ? [this.lastError] : [],
@@ -195,9 +269,9 @@ export class RepoRuntime {
       case "disabled":
         return "Run `/index enable` to start background indexing for this repository.";
       case "initializing":
-        return "Repo runtime is registered and storage anchors exist. Wait for the indexing pipeline to populate content in the next slice.";
+        return "Initial indexing is queued. Wait for background analysis to complete, then run `/index status` again.";
       case "indexing":
-        return "A reindex was requested. Wait for indexing to complete, then run `/index status` again.";
+        return "A soft rebuild is in progress. Wait for indexing to complete, then run `/index status` again.";
       case "stale":
         return "Run `/index reindex` after git or filesystem changes settle.";
       case "error":
@@ -223,4 +297,13 @@ export class RepoRuntime {
         return "not-yet-indexed";
     }
   }
+}
+
+function buildCoverage(eligibleFiles: number, indexedFiles: number, omittedFiles: number): CoverageMetadata {
+  return {
+    eligibleFiles,
+    indexedFiles,
+    indexedPercent: eligibleFiles === 0 ? 0 : Math.round((indexedFiles / eligibleFiles) * 100),
+    omittedFiles,
+  };
 }

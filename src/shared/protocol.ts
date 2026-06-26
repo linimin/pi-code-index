@@ -37,6 +37,7 @@ export interface CoverageMetadata {
   eligibleFiles: number;
   indexedFiles: number;
   indexedPercent: number;
+  omittedFiles: number;
 }
 
 export interface RuntimePaths {

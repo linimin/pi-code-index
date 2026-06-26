@@ -1,6 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { realpath } from "node:fs/promises";
+import { realpath, rm } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { basename } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -252,11 +252,18 @@ export class DaemonClient {
   private async ensureCompatibleDaemon(startIfNeeded: boolean): Promise<HealthResponse> {
     const health = await this.ensureDaemon(startIfNeeded);
 
-    if (health.protocolVersion !== DAEMON_PROTOCOL_VERSION) {
-      throw new ProtocolMismatchError(DAEMON_PROTOCOL_VERSION, health.protocolVersion);
+    if (health.protocolVersion === DAEMON_PROTOCOL_VERSION) {
+      return health;
     }
 
-    return health;
+    if (startIfNeeded) {
+      const restartedHealth = await this.restartIncompatibleDaemon(health).catch(() => null);
+      if (restartedHealth?.protocolVersion === DAEMON_PROTOCOL_VERSION) {
+        return restartedHealth;
+      }
+    }
+
+    throw new ProtocolMismatchError(DAEMON_PROTOCOL_VERSION, health.protocolVersion);
   }
 
   private async ensureDaemon(startIfNeeded: boolean): Promise<HealthResponse> {
@@ -270,7 +277,44 @@ export class DaemonClient {
 
     this.assertSupportedPlatform();
     this.spawnDaemon();
+    return this.waitForHealth();
+  }
 
+  private async restartIncompatibleDaemon(health: HealthResponse): Promise<HealthResponse> {
+    this.assertSupportedPlatform();
+
+    try {
+      process.kill(health.pid, "SIGTERM");
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ESRCH") {
+        throw error;
+      }
+    }
+
+    const exitDeadline = Date.now() + this.startTimeoutMs;
+    while (Date.now() < exitDeadline) {
+      try {
+        const current = await this.rawRequest<Record<string, never>, HealthResponse>("health", {});
+        if (current.instanceId !== health.instanceId || current.pid !== health.pid) {
+          return current;
+        }
+      } catch (error) {
+        if (!isAvailabilityError(error)) {
+          throw error;
+        }
+        break;
+      }
+
+      await delay(50);
+    }
+
+    await this.cleanupSocketArtifacts();
+    this.spawnDaemon();
+    return this.waitForHealth();
+  }
+
+  private async waitForHealth(): Promise<HealthResponse> {
     const deadline = Date.now() + this.startTimeoutMs;
     while (Date.now() < deadline) {
       try {
@@ -288,6 +332,18 @@ export class DaemonClient {
       this.socketPath,
       `Timed out waiting for the pi-code-index daemon to become reachable at ${this.socketPath}.`,
     );
+  }
+
+  private async cleanupSocketArtifacts(): Promise<void> {
+    const runtimePaths = buildRuntimePaths({
+      cacheDir: this.cacheDir,
+      socketPath: this.socketPath,
+    });
+
+    await Promise.all([
+      rm(this.socketPath, { force: true }).catch(() => undefined),
+      rm(runtimePaths.pidFile, { force: true }).catch(() => undefined),
+    ]);
   }
 
   private spawnDaemon(): void {

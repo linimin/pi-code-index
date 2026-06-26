@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export const DAEMON_PROTOCOL_VERSION = 1 as const;
+export const DAEMON_PROTOCOL_VERSION = 2 as const;
 export const SQLITE_SCHEMA_VERSION = 1 as const;
 export const INDEXER_LANGUAGE_ADAPTER_SET = [
   "typescript",

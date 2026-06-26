@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 
 import { registerIndexCommand } from "../src/extension/commands/index-command.ts";
 import { DaemonClient, DaemonUnavailableError, resolveRepoLocator } from "../src/extension/daemon-client.ts";
@@ -45,6 +45,106 @@ test("daemon lazy-starts and handshakes over the Unix socket", async (t) => {
   assert.equal(await pathExists(socketPath), true);
 });
 
+test("daemon client restarts an incompatible legacy daemon before serving status", async (t) => {
+  const tempRoot = await mkdtemp(join(tmpdir(), "pi-code-index-legacy-"));
+  const repoDir = join(tempRoot, "repo");
+  const cacheDir = join(tempRoot, "cache");
+  const socketPath = join(cacheDir, "daemon.sock");
+  const client = new DaemonClient({ cacheDir, socketPath, startTimeoutMs: 8_000, requestTimeoutMs: 2_000 });
+
+  await setupGitRepo(repoDir);
+  const repo = await resolveRepoLocator(repoDir);
+  const legacyDaemon = spawnLegacyProtocolDaemon(socketPath);
+  await waitFor(async () => await pathExists(socketPath), 5_000);
+
+  t.after(async () => {
+    legacyDaemon.kill("SIGTERM");
+    await stopDaemon(client);
+    await rm(tempRoot, { recursive: true, force: true });
+  });
+
+  const status = await client.getStatus(repo);
+
+  assert.equal(status.protocolVersion, DAEMON_PROTOCOL_VERSION);
+  assert.equal(status.repoRoot, repo.repoRoot);
+  await waitFor(async () => legacyDaemon.exitCode !== null, 3_000);
+});
+
+test("/index status and /index doctor degrade gracefully when a legacy daemon payload omits lifecycle fields", async () => {
+  const repo = {
+    repoRoot: "/tmp/legacy-repo",
+    repoName: "legacy-repo",
+    gitDir: "/tmp/legacy-repo/.git",
+    worktreeId: "legacy-worktree",
+    headCommit: "abc123",
+  } satisfies RepoLocator;
+
+  const statusPayload = {
+    repoId: "legacy-repo-id",
+    repoRoot: repo.repoRoot,
+    repoName: repo.repoName,
+    worktreeId: repo.worktreeId,
+    enabled: true,
+    state: "ready",
+    mode: "local-daemon",
+    transport: "unix:///tmp/legacy.sock",
+    protocolVersion: DAEMON_PROTOCOL_VERSION - 1,
+    daemonVersion: "0.1.0",
+    headCommit: repo.headCommit,
+    indexedFiles: 1,
+    filesPending: 0,
+    coverage: { eligibleFiles: 1, indexedFiles: 1, indexedPercent: 100, omittedFiles: 0 },
+    lastUpdated: new Date().toISOString(),
+    baseline: createTestAnchor("baseline", "/tmp/legacy-baseline.sqlite"),
+    overlay: createTestAnchor("overlay", "/tmp/legacy-overlay.sqlite"),
+    recommendedAction: "No action needed.",
+  } as unknown as import("../src/shared/protocol.ts").RepoStatus;
+
+  const diagnosticsPayload = {
+    ...statusPayload,
+    instanceId: "legacy-instance",
+    pid: 123,
+    startedAt: new Date().toISOString(),
+    freshness: "current",
+    repoIdentity: {
+      repoId: statusPayload.repoId,
+      repoRoot: repo.repoRoot,
+      gitDir: repo.gitDir,
+      worktreeId: repo.worktreeId,
+    },
+    analyzerCapabilities: { typescript: "structural" },
+    queueDepth: 0,
+    activeJobs: [],
+    storageSummary: { baselineCount: 1, overlayBytes: 0, totalBytes: 0 },
+    actionableErrors: [],
+  } as unknown as import("../src/shared/protocol.ts").RepoDiagnostics;
+
+  const indexCommand = createRegisteredIndexCommand(
+    {},
+    {
+      createClient: () => ({
+        openRepo: async () => ({}) as never,
+        enableRepoIndexing: async () => statusPayload,
+        disableRepoIndexing: async () => statusPayload,
+        getStatus: async () => statusPayload,
+        getRepoDiagnostics: async () => diagnosticsPayload,
+        reindexRepo: async () => statusPayload,
+      }),
+      resolveRepo: async () => repo,
+    },
+  );
+
+  const statusNotifications = await runIndexCommand(indexCommand, "status", repo.repoRoot);
+  assert.match(statusNotifications[0]?.message ?? "", /Runtime loaded: unknown \(restart the daemon after upgrading pi-code-index\)/);
+  assert.match(statusNotifications[0]?.message ?? "", /Daemon lifecycle: unavailable/);
+  assert.match(statusNotifications[0]?.message ?? "", /Registry: unavailable/);
+
+  const doctorNotifications = await runIndexCommand(indexCommand, "doctor", repo.repoRoot);
+  assert.match(doctorNotifications[0]?.message ?? "", /Runtime loaded: unknown \(restart the daemon after upgrading pi-code-index\)/);
+  assert.match(doctorNotifications[0]?.message ?? "", /Daemon lifecycle: unavailable/);
+  assert.match(doctorNotifications[0]?.message ?? "", /Idle shutdown: unavailable/);
+  assert.match(doctorNotifications[0]?.message ?? "", /Registry states: unavailable/);
+});
 
 test("daemon idles out after the last enabled repo is disabled and cleanly restarts on demand", async (t) => {
   const tempRoot = await mkdtemp(join(tmpdir(), "pi-code-index-idle-"));
@@ -234,7 +334,10 @@ test("/index enable -> /index status -> /index doctor uses real daemon state and
   assert.equal(JSON.parse(baselineMetadata.get("languageAdapterSet") ?? "[]").includes("typescript"), true);
 });
 
-function createRegisteredIndexCommand(clientOptions: ConstructorParameters<typeof DaemonClient>[0]): RegisteredCommand {
+function createRegisteredIndexCommand(
+  clientOptions: ConstructorParameters<typeof DaemonClient>[0],
+  overrides: Partial<Parameters<typeof registerIndexCommand>[1]> = {},
+): RegisteredCommand {
   let registeredCommand: RegisteredCommand | undefined;
 
   registerIndexCommand(
@@ -246,6 +349,7 @@ function createRegisteredIndexCommand(clientOptions: ConstructorParameters<typeo
     {
       createClient: () => new DaemonClient(clientOptions),
       resolveRepo: resolveRepoLocator,
+      ...overrides,
     },
   );
 
@@ -286,6 +390,72 @@ function execGit(cwd: string, args: string[]): void {
     cwd,
     stdio: ["ignore", "pipe", "pipe"],
     encoding: "utf8",
+  });
+}
+
+function createTestAnchor(kind: "baseline" | "overlay", dbPath: string) {
+  return {
+    kind,
+    dbPath,
+    exists: true,
+    bytes: 0,
+    metadata: {
+      schemaVersion: 1,
+      indexerVersion: "0.1.0",
+      languageAdapterSet: ["typescript"],
+      createdAt: new Date().toISOString(),
+    },
+  };
+}
+
+function spawnLegacyProtocolDaemon(socketPath: string) {
+  const script = `
+    const { createServer } = require("node:net");
+    const { mkdirSync } = require("node:fs");
+    const { dirname } = require("node:path");
+
+    const socketPath = process.env.SOCKET_PATH;
+    mkdirSync(dirname(socketPath), { recursive: true });
+
+    const server = createServer((socket) => {
+      socket.setEncoding("utf8");
+      let buffer = "";
+      socket.on("data", (chunk) => {
+        buffer += chunk;
+        while (true) {
+          const newlineIndex = buffer.indexOf("\\n");
+          if (newlineIndex < 0) break;
+          const line = buffer.slice(0, newlineIndex);
+          buffer = buffer.slice(newlineIndex + 1);
+          if (!line.trim()) continue;
+          const request = JSON.parse(line);
+          socket.write(JSON.stringify({
+            id: request.id,
+            ok: true,
+            result: {
+              daemonVersion: "0.1.0",
+              protocolVersion: ${DAEMON_PROTOCOL_VERSION - 1},
+              instanceId: "legacy-instance",
+              pid: process.pid,
+              startedAt: new Date().toISOString(),
+              capabilities: ["health"],
+            },
+          }) + "\\n");
+        }
+      });
+    });
+
+    server.listen(socketPath);
+    process.on("SIGTERM", () => server.close(() => process.exit(0)));
+    process.on("SIGINT", () => server.close(() => process.exit(0)));
+  `;
+
+  return spawn(process.execPath, ["-e", script], {
+    stdio: "ignore",
+    env: {
+      ...process.env,
+      SOCKET_PATH: socketPath,
+    },
   });
 }
 

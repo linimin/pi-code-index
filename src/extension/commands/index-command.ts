@@ -186,21 +186,23 @@ function formatReindexMessage(status: RepoStatus): string {
 }
 
 function formatStatusMessage(status: RepoStatus): string {
+  const daemonLifecycle = status.daemonLifecycle;
+
   return [
     "pi-code-index status",
     `Repo: ${status.repoName}`,
     `Root: ${status.repoRoot}`,
     `Worktree ID: ${status.worktreeId}`,
     `Enabled: ${status.enabled ? "yes" : "no"}`,
-    `Runtime loaded: ${status.runtimeLoaded ? "yes" : "no"}`,
+    `Runtime loaded: ${formatRuntimeLoaded(status.runtimeLoaded)}`,
     `State: ${status.state}`,
     `Mode: ${status.mode}`,
     `Indexed files: ${status.indexedFiles}`,
     `Pending files: ${status.filesPending}`,
     `Coverage: ${formatCoverage(status.coverage)}`,
-    `Daemon lifecycle: enabledRepos=${status.daemonLifecycle.enabledRepoCount}, loadedRuntimes=${status.daemonLifecycle.loadedRuntimeCount}, activeRequests=${status.daemonLifecycle.activeRequestCount}, activeJobs=${status.daemonLifecycle.activeJobCount}`,
-    `Idle shutdown: ${formatIdleShutdown(status.daemonLifecycle.idleShutdown)}`,
-    `Registry: registered=${status.daemonLifecycle.registry.registeredRepoCount}, enabled=${status.daemonLifecycle.registry.enabledRepoCount}, disabled=${status.daemonLifecycle.registry.disabledRepoCount}`,
+    `Daemon lifecycle: ${formatDaemonLifecycle(daemonLifecycle)}`,
+    `Idle shutdown: ${formatIdleShutdown(daemonLifecycle?.idleShutdown)}`,
+    `Registry: ${formatRegistrySummary(daemonLifecycle?.registry)}`,
     `HEAD baseline: ${status.headCommit ?? "unborn HEAD"}`,
     `Baseline DB: ${status.baseline.dbPath}`,
     `Overlay DB: ${status.overlay.dbPath}`,
@@ -213,6 +215,8 @@ function formatStatusMessage(status: RepoStatus): string {
 }
 
 function formatDoctorMessage(diagnostics: RepoDiagnostics): string {
+  const daemonLifecycle = diagnostics.daemonLifecycle;
+
   return [
     "pi-code-index doctor",
     `Daemon running: yes`,
@@ -226,14 +230,14 @@ function formatDoctorMessage(diagnostics: RepoDiagnostics): string {
     `Git dir: ${diagnostics.repoIdentity.gitDir}`,
     `Worktree ID: ${diagnostics.worktreeId}`,
     `Enabled: ${diagnostics.enabled ? "yes" : "no"}`,
-    `Runtime loaded: ${diagnostics.runtimeLoaded ? "yes" : "no"}`,
+    `Runtime loaded: ${formatRuntimeLoaded(diagnostics.runtimeLoaded)}`,
     `State: ${diagnostics.state}`,
     `Freshness: ${diagnostics.freshness}`,
     `Coverage: ${formatCoverage(diagnostics.coverage)}`,
-    `Daemon lifecycle: enabledRepos=${diagnostics.daemonLifecycle.enabledRepoCount}, loadedRuntimes=${diagnostics.daemonLifecycle.loadedRuntimeCount}, activeRequests=${diagnostics.daemonLifecycle.activeRequestCount}, activeJobs=${diagnostics.daemonLifecycle.activeJobCount}`,
-    `Idle shutdown: ${formatIdleShutdown(diagnostics.daemonLifecycle.idleShutdown)}`,
-    `Registry: db=${diagnostics.daemonLifecycle.registry.dbPath}, registered=${diagnostics.daemonLifecycle.registry.registeredRepoCount}, enabled=${diagnostics.daemonLifecycle.registry.enabledRepoCount}, disabled=${diagnostics.daemonLifecycle.registry.disabledRepoCount}`,
-    `Registry states: ${formatRegistryStateCounts(diagnostics.daemonLifecycle.registry.stateCounts)}`,
+    `Daemon lifecycle: ${formatDaemonLifecycle(daemonLifecycle)}`,
+    `Idle shutdown: ${formatIdleShutdown(daemonLifecycle?.idleShutdown)}`,
+    `Registry: ${formatRegistrySummary(daemonLifecycle?.registry, { includeDbPath: true })}`,
+    `Registry states: ${formatRegistryStateCounts(daemonLifecycle?.registry?.stateCounts)}`,
     `Analyzers: ${formatAnalyzerCapabilities(diagnostics.analyzerCapabilities)}`,
     `Queue depth: ${diagnostics.queueDepth}`,
     `Active jobs: ${diagnostics.activeJobs.length > 0 ? diagnostics.activeJobs.join(", ") : "none"}`,
@@ -252,13 +256,55 @@ function formatCoverage(coverage: RepoStatus["coverage"]): string {
   return `${coverage.indexedFiles}/${coverage.eligibleFiles} (${coverage.indexedPercent}%)`;
 }
 
-function formatIdleShutdown(idleShutdown: RepoStatus["daemonLifecycle"]["idleShutdown"]): string {
+function formatRuntimeLoaded(runtimeLoaded: boolean | undefined): string {
+  if (typeof runtimeLoaded === "boolean") {
+    return runtimeLoaded ? "yes" : "no";
+  }
+
+  return "unknown (restart the daemon after upgrading pi-code-index)";
+}
+
+function formatDaemonLifecycle(daemonLifecycle: RepoStatus["daemonLifecycle"] | undefined): string {
+  if (!daemonLifecycle) {
+    return "unavailable (restart the daemon after upgrading pi-code-index)";
+  }
+
+  return `enabledRepos=${daemonLifecycle.enabledRepoCount}, loadedRuntimes=${daemonLifecycle.loadedRuntimeCount}, activeRequests=${daemonLifecycle.activeRequestCount}, activeJobs=${daemonLifecycle.activeJobCount}`;
+}
+
+function formatIdleShutdown(idleShutdown: RepoStatus["daemonLifecycle"]["idleShutdown"] | undefined): string {
+  if (!idleShutdown) {
+    return "unavailable (restart the daemon after upgrading pi-code-index)";
+  }
+
   const blocked = idleShutdown.blockedBy.length > 0 ? idleShutdown.blockedBy.join(",") : "none";
   const deadline = idleShutdown.deadlineAt ? `, deadline=${idleShutdown.deadlineAt}` : "";
   return `eligible=${idleShutdown.eligible ? "yes" : "no"}, scheduled=${idleShutdown.scheduled ? "yes" : "no"}, graceMs=${idleShutdown.graceMs}, blockedBy=${blocked}${deadline}`;
 }
 
-function formatRegistryStateCounts(stateCounts: RepoStatus["daemonLifecycle"]["registry"]["stateCounts"]): string {
+function formatRegistrySummary(
+  registry: RepoStatus["daemonLifecycle"]["registry"] | undefined,
+  options: { includeDbPath?: boolean } = {},
+): string {
+  if (!registry) {
+    return "unavailable (restart the daemon after upgrading pi-code-index)";
+  }
+
+  const parts = [
+    options.includeDbPath ? `db=${registry.dbPath}` : null,
+    `registered=${registry.registeredRepoCount}`,
+    `enabled=${registry.enabledRepoCount}`,
+    `disabled=${registry.disabledRepoCount}`,
+  ].filter((part): part is string => part !== null);
+
+  return parts.join(", ");
+}
+
+function formatRegistryStateCounts(stateCounts: RepoStatus["daemonLifecycle"]["registry"]["stateCounts"] | undefined): string {
+  if (!stateCounts) {
+    return "unavailable (restart the daemon after upgrading pi-code-index)";
+  }
+
   return Object.entries(stateCounts)
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([state, count]) => `${state}=${count}`)

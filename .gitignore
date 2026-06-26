@@ -12,3 +12,6 @@ dist/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+
+# completion workflow local state
+.agent/

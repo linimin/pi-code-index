@@ -1,3 +1,3 @@
-import createPiCodeIndexExtension from "../src/extension/index";
+import createPiCodeIndexExtension from "../src/extension/index.ts";
 
 export default createPiCodeIndexExtension;

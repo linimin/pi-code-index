@@ -5,7 +5,7 @@
   "type": "module",
   "license": "UNLICENSED",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.6.0"
   },
   "keywords": [
     "pi-package",
@@ -23,9 +23,10 @@
     "tsconfig.json"
   ],
   "scripts": {
-    "check": "npm run typecheck",
+    "check": "node --experimental-strip-types ./tests/check.ts",
     "typecheck": "tsc --noEmit",
-    "dev:daemon": "tsx src/daemon/main.ts"
+    "test": "node --experimental-strip-types --test ./tests/*.test.ts",
+    "dev:daemon": "node --experimental-strip-types ./src/daemon/main.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
